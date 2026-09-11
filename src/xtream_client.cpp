@@ -2,12 +2,14 @@
 
 #include <kodi/Filesystem.h>
 #include <kodi/General.h>
+#include <kodi/addon-instance/PVR.h>
 #include <pugixml.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 #include <cstdlib>
 #include <string>
@@ -49,6 +51,207 @@ std::string ToLower(std::string s)
     return static_cast<char>(std::tolower(c));
   });
   return s;
+}
+
+void ParseProgrammeGenre(const pugi::xml_node& programmeNode, xtream::EpgEntry& entry)
+{
+  std::vector<std::string> categories;
+  for (const auto& categoryNode : programmeNode.children("category"))
+  {
+    const std::string category = Trim(categoryNode.child_value());
+    if (category.empty())
+      continue;
+
+    // Kodi uses EPG_STRING_TOKEN_SEPARATOR (a comma) between free-text genres.
+    if (!entry.genreString.empty())
+      entry.genreString += EPG_STRING_TOKEN_SEPARATOR;
+    entry.genreString += category;
+    categories.push_back(ToLower(category));
+  }
+
+  const auto hasAny = [&categories](std::initializer_list<const char*> values) {
+    for (const auto& category : categories)
+    {
+      for (const char* value : values)
+      {
+        if (category == value)
+          return true;
+      }
+    }
+    return false;
+  };
+
+  // Prefer specific categories over generic XMLTV categories such as "Series".
+  // Sports has the highest priority because feeds often also label games as series.
+  if (hasAny({"football", "soccer"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_FOOTBALL_SOCCER;
+  }
+  else if (hasAny({"tennis"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_TENNIS_SQUASH;
+  }
+  else if (hasAny({"volleyball", "basketball"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_TEAMSPORTS;
+  }
+  else if (hasAny({"track/field"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_ATHLETICS;
+  }
+  else if (hasAny({"auto racing", "motorcycle racing"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_MOTORSPORT;
+  }
+  else if (hasAny({"sailing"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_WATERSPORT;
+  }
+  else if (hasAny({"sports talk"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_SPORTS_MAGAZINES;
+  }
+  else if (hasAny({"sports", "playoff sports", "golf", "fishing"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPORTS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPORTS_GENERAL;
+  }
+  else if (hasAny({"weather"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_NEWSCURRENTAFFAIRS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_NEWSCURRENTAFFAIRS_WEATHER;
+  }
+  else if (hasAny({"newsmagazine"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_NEWSCURRENTAFFAIRS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_NEWSCURRENTAFFAIRS_MAGAZINE;
+  }
+  else if (hasAny({"news", "political news satire & talk"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_NEWSCURRENTAFFAIRS;
+    entry.genreSubType = hasAny({"interview", "debate"})
+                             ? EPG_EVENT_CONTENTSUBMASK_NEWSCURRENTAFFAIRS_DISCUSSION_INTERVIEW_DEBATE
+                             : EPG_EVENT_CONTENTSUBMASK_NEWSCURRENTAFFAIRS_GENERAL;
+  }
+  else if (hasAny({"children", "animated"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_CHILDRENYOUTH;
+    entry.genreSubType = hasAny({"animated"})
+                             ? EPG_EVENT_CONTENTSUBMASK_CHILDRENYOUTH_CARTOONS_PUPPETS
+                             : EPG_EVENT_CONTENTSUBMASK_CHILDRENYOUTH_GENERAL;
+  }
+  else if (hasAny({"game show"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SHOW;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SHOW_GAMESHOW_QUIZ_CONTEST;
+  }
+  else if (hasAny({"variety"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SHOW;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SHOW_VARIETY_SHOW;
+  }
+  else if (hasAny({"talk", "interview", "debate"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SHOW;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SHOW_TALK_SHOW;
+  }
+  else if (hasAny({"reality", "competition reality", "entertainment"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SHOW;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SHOW_GENERAL;
+  }
+  else if (hasAny({"crime", "crime drama", "mystery"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MOVIEDRAMA;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MOVIEDRAMA_DETECTIVE_THRILLER;
+  }
+  else if (hasAny({"action", "adventure"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MOVIEDRAMA;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MOVIEDRAMA_ADVENTURE_WESTERN_WAR;
+  }
+  else if (hasAny({"comedy", "sitcom"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MOVIEDRAMA;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MOVIEDRAMA_COMEDY;
+  }
+  else if (hasAny({"soap"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MOVIEDRAMA;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MOVIEDRAMA_SOAP_MELODRAMA_FOLKLORIC;
+  }
+  else if (hasAny({"romance"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MOVIEDRAMA;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MOVIEDRAMA_ROMANCE;
+  }
+  else if (hasAny({"movie", "drama", "docudrama"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MOVIEDRAMA;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MOVIEDRAMA_GENERAL;
+  }
+  else if (hasAny({"music", "dance"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_MUSICBALLETDANCE;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_MUSICBALLETDANCE_GENERAL;
+  }
+  else if (hasAny({"religious"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_ARTSCULTURE;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_ARTSCULTURE_RELIGION;
+  }
+  else if (hasAny({"politics", "public affairs", "community", "consumer", "law"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SOCIALPOLITICALECONOMICS;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SOCIALPOLITICALECONOMICS_GENERAL;
+  }
+  else if (hasAny({"nature", "animals", "environment"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_EDUCATIONALSCIENCE;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_EDUCATIONALSCIENCE_NATURE_ANIMALS_ENVIRONMENT;
+  }
+  else if (hasAny({"medical", "health"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_EDUCATIONALSCIENCE;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_EDUCATIONALSCIENCE_MEDICINE_PHYSIOLOGY_PSYCHOLOGY;
+  }
+  else if (hasAny({"documentary", "educational", "science", "history", "american history"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_EDUCATIONALSCIENCE;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_EDUCATIONALSCIENCE_GENERAL;
+  }
+  else if (hasAny({"travel"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_LEISUREHOBBIES;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_LEISUREHOBBIES_TOURISM_TRAVEL;
+  }
+  else if (hasAny({"shopping"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_LEISUREHOBBIES;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_LEISUREHOBBIES_ADVERTISEMENT_SHOPPING;
+  }
+  else if (hasAny({"house/garden", "home improvement"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_LEISUREHOBBIES;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_LEISUREHOBBIES_GARDENING;
+  }
+  else if (hasAny({"pets", "fashion", "how-to", "self improvement"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_LEISUREHOBBIES;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_LEISUREHOBBIES_GENERAL;
+  }
+  else if (hasAny({"special"}))
+  {
+    entry.genreType = EPG_EVENT_CONTENTMASK_SPECIAL;
+    entry.genreSubType = EPG_EVENT_CONTENTSUBMASK_SPECIAL_GENERAL;
+  }
 }
 
 std::string NormalizeChannelNameForEpg(const std::string& in)
@@ -1347,10 +1550,8 @@ bool ParseXMLTV(const std::string& xmltvData,
         entry.iconPath = srcAttr;
     }
 
-    // Parse category (genre)
-    const auto& categoryNode = programmeNode.child("category");
-    if (categoryNode)
-      entry.genreString = categoryNode.child_value();
+    // Preserve all XMLTV categories and map recognized values to Kodi's DVB genres.
+    ParseProgrammeGenre(programmeNode, entry);
 
     // Add entry to each mapped stream's EPG (keyed by start time)
     for (const auto& mappedId : mapIt->second)

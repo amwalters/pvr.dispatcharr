@@ -1235,7 +1235,15 @@ public:
       if (!entry.iconPath.empty())
         tag.SetIconPath(entry.iconPath);
       if (entry.genreType > 0)
+      {
         tag.SetGenreType(entry.genreType);
+        tag.SetGenreSubType(entry.genreSubType);
+      }
+      else if (!entry.genreString.empty())
+      {
+        tag.SetGenreType(EPG_GENRE_USE_STRING);
+        tag.SetGenreDescription(entry.genreString);
+      }
       if (entry.year > 0)
         tag.SetYear(entry.year);
       if (entry.starRating > 0)
