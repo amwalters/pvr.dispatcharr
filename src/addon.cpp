@@ -769,7 +769,6 @@ public:
 
       // 3. Scheduled Recordings (Type 1)
       std::vector<dispatcharr::Recording> recs;
-      bool hasActiveRecording = false;
       if (m_dispatcharrClient->FetchRecordings(recs)) {
           int timerCount = 0;
           for (const auto& r : recs) {
@@ -779,8 +778,6 @@ public:
                         r.id, r.status.c_str(), r.title.c_str(), r.channelId);
               if (r.status != "scheduled" && r.status != "recording") 
                   continue;
-              if (r.status == "recording")
-                  hasActiveRecording = true;
               timerCount++;
               
               kodi::addon::PVRTimer t;
@@ -808,11 +805,6 @@ public:
           kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers - fetched %zu recordings, %d as timers", recs.size(), timerCount);
       }
 
-      // A Dispatcharr recording can transition asynchronously after AddTimer().
-      // Once its timer reports "recording", ask Kodi to import the playable item.
-      if (hasActiveRecording)
-          TriggerRecordingUpdate();
-      
       kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers complete");
       return PVR_ERROR_NO_ERROR;
   }
@@ -2297,14 +2289,16 @@ private:
           if (client->FetchRecordings(recordings))
           {
             std::unordered_map<int, std::string> currentStatuses;
-            bool hasActive = false;
             bool changed = false;
             for (const auto& recording : recordings)
             {
               currentStatuses.emplace(recording.id, recording.status);
-              hasActive = hasActive || recording.status == "recording";
               const auto old = previousStatuses.find(recording.id);
-              if (old != previousStatuses.end() && old->second != recording.status)
+              if (old == previousStatuses.end())
+              {
+                changed = true;
+              }
+              else if (old->second != recording.status)
               {
                 changed = true;
                 kodi::Log(ADDON_LOG_INFO,
@@ -2312,10 +2306,12 @@ private:
                           recording.id, old->second.c_str(), recording.status.c_str());
               }
             }
+            changed = changed || currentStatuses.size() != previousStatuses.size();
 
-            // Refresh continuously while recording so Kodi imports new active
-            // items promptly and updates their growing duration.
-            if (changed || hasActive)
+            // Notify only for actual collection/status transitions. Triggering
+            // from GetTimers(), or on every poll while active, creates a refresh
+            // feedback loop that can cancel playback while Kodi starts it.
+            if (changed)
             {
               TriggerTimerUpdate();
               TriggerRecordingUpdate();
