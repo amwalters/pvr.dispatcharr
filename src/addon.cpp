@@ -124,14 +124,6 @@ std::string TranslateSpecial(const std::string& url)
   }
 }
 
-std::string LocalPathToFileUrl(std::string path)
-{
-  std::replace(path.begin(), path.end(), '\\', '/');
-  if (!path.empty() && path.front() == '/')
-    return "file://" + path;
-  return "file:///" + path;
-}
-
 constexpr uint32_t kCacheMagic = 0x31435458; // 'XTC1' little-endian
 
 void AppendU32(std::string& out, uint32_t v)
@@ -619,16 +611,11 @@ public:
         return PVR_ERROR_FAILED;
       }
 
-      // PVR stream properties require a concrete media URL. `special://` is a
-      // Kodi VFS alias, but is rejected here before VideoPlayer is started.
-      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL,
-                              LocalPathToFileUrl(manifestPath));
-      properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.ffmpegdirect");
+      // Hand the translated local path to Kodi's native HLS player. This is
+      // the same form Kodi accepts through PlayMedia for this VOD snapshot.
+      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestPath);
       properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/vnd.apple.mpegurl");
       properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
-      properties.emplace_back("inputstream.ffmpegdirect.open_mode", "ffmpeg");
-      properties.emplace_back("inputstream.ffmpegdirect.manifest_type", "hls");
-      properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
       kodi::Log(ADDON_LOG_INFO,
                 "pvr.dispatcharr: Prepared seekable active-recording manifest for recording %s",
                 recordingId.c_str());
