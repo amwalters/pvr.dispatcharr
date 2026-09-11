@@ -598,9 +598,10 @@ public:
 
     if (playback.inProgress)
     {
-      const std::string manifestPath = TranslateSpecial(
+      const std::string manifestUrl =
           "special://temp/pvr.dispatcharr/recording-" +
-          std::to_string(id) + ".m3u8");
+          std::to_string(id) + ".m3u8";
+      const std::string manifestPath = TranslateSpecial(manifestUrl);
       if (manifestPath.empty() ||
           !WriteStringToFileAtomic(manifestPath, playback.playlist))
       {
@@ -610,7 +611,9 @@ public:
         return PVR_ERROR_FAILED;
       }
 
-      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestPath);
+      // Return the Kodi VFS URL, not its platform-specific translated path.
+      // The latter is suitable for std::ofstream but is not a portable media URL.
+      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestUrl);
       properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/vnd.apple.mpegurl");
       properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
       kodi::Log(ADDON_LOG_INFO,
