@@ -47,6 +47,7 @@ namespace
 {
 constexpr auto kEpgRefreshInterval = std::chrono::minutes(60);
 constexpr auto kEpgRefreshRetryInterval = std::chrono::minutes(5);
+constexpr auto kRecordingPollInterval = std::chrono::seconds(10);
 
 std::string Trim(std::string s)
 {
@@ -361,6 +362,7 @@ public:
   {
     kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: instance created");
     StartEpgWorkerThread();
+    StartRecordingMonitorThread();
     StartBootstrapThread();
   }
 
@@ -369,12 +371,15 @@ public:
     m_stopRequested = true;
     m_cv.notify_all();
     m_epgCv.notify_all();
+    m_recordingCv.notify_all();
     if (m_bootstrap.joinable())
       m_bootstrap.join();
     if (m_worker.joinable())
       m_worker.join();
     if (m_epgWorker.joinable())
       m_epgWorker.join();
+    if (m_recordingMonitor.joinable())
+      m_recordingMonitor.join();
   }
 
   void SetSettingsOverride(const xtream::Settings& settings)
@@ -592,8 +597,8 @@ public:
       return PVR_ERROR_INVALID_PARAMETERS;
     }
 
-    std::string streamUrl;
-    if (!m_dispatcharrClient->GetRecordingStreamUrl(id, streamUrl))
+    dispatcharr::RecordingPlayback playback;
+    if (!m_dispatcharrClient->GetRecordingPlayback(id, playback))
     {
       kodi::Log(ADDON_LOG_ERROR,
                 "pvr.dispatcharr: Failed to prepare playback for recording %s",
@@ -601,7 +606,32 @@ public:
       return PVR_ERROR_SERVER_ERROR;
     }
 
-    properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, streamUrl);
+    if (playback.inProgress)
+    {
+      const std::string manifestPath = TranslateSpecial(
+          "special://temp/pvr.dispatcharr/recording-" +
+          std::to_string(id) + ".m3u8");
+      if (manifestPath.empty() ||
+          !WriteStringToFileAtomic(manifestPath, playback.playlist))
+      {
+        kodi::Log(ADDON_LOG_ERROR,
+                  "pvr.dispatcharr: Failed to write playback manifest for recording %d",
+                  id);
+        return PVR_ERROR_FAILED;
+      }
+
+      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestPath);
+      properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.ffmpegdirect");
+      properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/vnd.apple.mpegurl");
+      properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
+      properties.emplace_back("inputstream.ffmpegdirect.open_mode", "ffmpeg");
+      properties.emplace_back("inputstream.ffmpegdirect.manifest_type", "hls");
+      properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
+    }
+    else
+    {
+      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, playback.url);
+    }
 
     // Do not log streamUrl: it contains the short-lived playback JWT.
     kodi::Log(ADDON_LOG_DEBUG,
@@ -2340,6 +2370,80 @@ private:
     });
   }
 
+  void StartRecordingMonitorThread()
+  {
+    m_recordingMonitor = std::thread([this]() {
+      std::string clientSignature;
+      std::unique_ptr<dispatcharr::Client> client;
+      std::unordered_map<int, std::string> previousStatuses;
+
+      while (!m_stopRequested)
+      {
+        xtream::Settings settings;
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          settings = m_xtreamSettings;
+        }
+
+        const std::string password = !settings.dispatcharrPassword.empty()
+                                         ? settings.dispatcharrPassword
+                                         : settings.password;
+        const std::string signature = settings.server + "\n" +
+                                      std::to_string(settings.port) + "\n" +
+                                      settings.username + "\n" + password;
+        if (!settings.server.empty() && !settings.username.empty() && !password.empty())
+        {
+          if (!client || signature != clientSignature)
+          {
+            dispatcharr::DvrSettings ds;
+            ds.server = settings.server;
+            ds.port = settings.port;
+            ds.username = settings.username;
+            ds.password = password;
+            ds.timeoutSeconds = settings.timeoutSeconds;
+            client = std::make_unique<dispatcharr::Client>(ds);
+            clientSignature = signature;
+            previousStatuses.clear();
+          }
+
+          std::vector<dispatcharr::Recording> recordings;
+          if (client->FetchRecordings(recordings))
+          {
+            std::unordered_map<int, std::string> currentStatuses;
+            bool hasActive = false;
+            bool changed = false;
+            for (const auto& recording : recordings)
+            {
+              currentStatuses.emplace(recording.id, recording.status);
+              hasActive = hasActive || recording.status == "recording";
+              const auto old = previousStatuses.find(recording.id);
+              if (old != previousStatuses.end() && old->second != recording.status)
+              {
+                changed = true;
+                kodi::Log(ADDON_LOG_INFO,
+                          "pvr.dispatcharr: recording %d changed status from '%s' to '%s'",
+                          recording.id, old->second.c_str(), recording.status.c_str());
+              }
+            }
+
+            // Refresh continuously while recording so Kodi imports new active
+            // items promptly and updates their growing duration.
+            if (changed || hasActive)
+            {
+              TriggerTimerUpdate();
+              TriggerRecordingUpdate();
+            }
+            previousStatuses = std::move(currentStatuses);
+          }
+        }
+
+        std::unique_lock<std::mutex> lock(m_recordingMutex);
+        m_recordingCv.wait_for(lock, kRecordingPollInterval,
+                              [this]() { return m_stopRequested.load(); });
+      }
+    });
+  }
+
   void StartBootstrapThread()
   {
     // Kodi can create the PVR instance before settings are fully available.
@@ -2530,6 +2634,9 @@ private:
   std::thread m_worker;
   std::thread m_epgWorker;
   std::thread m_bootstrap;
+  std::thread m_recordingMonitor;
+  std::mutex m_recordingMutex;
+  std::condition_variable m_recordingCv;
   std::atomic<bool> m_stopRequested{false};
   std::atomic<uint64_t> m_generation{0};
   std::atomic<int64_t> m_lastRefreshTriggerMs{0};

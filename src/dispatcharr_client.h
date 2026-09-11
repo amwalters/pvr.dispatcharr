@@ -51,6 +51,13 @@ struct Recording
   int kodiChannelUid = 0; // Kodi channel associated with the EPG event
 };
 
+struct RecordingPlayback
+{
+  std::string url;
+  std::string playlist;
+  bool inProgress = false;
+};
+
 struct TokenResponse
 {
   std::string accessToken;
@@ -93,6 +100,7 @@ public:
   // Recordings
   bool FetchRecordings(std::vector<Recording>& outRecordings);
   bool GetRecordingStreamUrl(int id, std::string& outUrl);
+  bool GetRecordingPlayback(int id, RecordingPlayback& outPlayback);
   bool DeleteRecording(int id);
   bool ScheduleRecording(int channelId,
                          time_t startTime,
