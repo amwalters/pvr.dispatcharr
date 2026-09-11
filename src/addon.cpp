@@ -716,7 +716,7 @@ public:
               t.SetTitle(r.name.empty() ? "Recurring" : r.name);
               t.SetTimerType(3);
               // Map Dispatcharr channel ID back to Kodi channel UID
-              int kodiUid = m_dispatcharrClient->GetKodiChannelUid(r.channelId);
+              int kodiUid = ResolveKodiChannelUid(r.channelId);
               if (kodiUid > 0) {
                   t.SetClientChannelUid(kodiUid);
               }
@@ -728,7 +728,7 @@ public:
           }
       }
 
-      // 3. Scheduled Recordings (Type 1)
+      // 3. Scheduled Recordings (manual type 1 or EPG-based type 4)
       std::vector<dispatcharr::Recording> recs;
       if (m_dispatcharrClient->FetchRecordings(recs)) {
           int timerCount = 0;
@@ -745,9 +745,16 @@ public:
               // Use the recording ID offset by 30000 to avoid collision
               t.SetClientIndex(static_cast<unsigned int>(30000 + r.id));
               t.SetTitle(r.title);
-              t.SetTimerType(1);
+              if (r.kodiEpgUid != EPG_TAG_INVALID_UID) {
+                  t.SetTimerType(4);
+                  t.SetEPGUid(r.kodiEpgUid);
+              } else {
+                  t.SetTimerType(1);
+              }
               // Map Dispatcharr channel ID back to Kodi channel UID
-              int kodiUid = m_dispatcharrClient->GetKodiChannelUid(r.channelId);
+              int kodiUid = r.kodiChannelUid != 0
+                                ? r.kodiChannelUid
+                                : ResolveKodiChannelUid(r.channelId);
               kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers - recording id=%d mapped channel %d -> kodiUid %d",
                         r.id, r.channelId, kodiUid);
               if (kodiUid > 0) {
@@ -896,7 +903,14 @@ public:
           const char* typeStr = (typeId == 4) ? "EPG one-shot" : "manual one-shot";
           kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: AddTimer (%s) - calling Dispatcharr API POST /api/channels/recordings/ with channel=%d, title='%s'",
                     typeStr, dispatchChannelId, timer.GetTitle().c_str());
-          if (m_dispatcharrClient->ScheduleRecording(dispatchChannelId, timer.GetStartTime(), timer.GetEndTime(), timer.GetTitle())) {
+          const unsigned int epgUid = (typeId == 4) ? timer.GetEPGUid() : EPG_TAG_INVALID_UID;
+          const int kodiChannelUid = (typeId == 4) ? chanUid : 0;
+          if (m_dispatcharrClient->ScheduleRecording(dispatchChannelId,
+                                                     timer.GetStartTime(),
+                                                     timer.GetEndTime(),
+                                                     timer.GetTitle(),
+                                                     epgUid,
+                                                     kodiChannelUid)) {
               kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: AddTimer (one-shot) - Dispatcharr API returned success, calling TriggerTimerUpdate");
               TriggerTimerUpdate();
               return PVR_ERROR_NO_ERROR;
@@ -1554,6 +1568,35 @@ public:
   }
 
 private:
+  int ResolveKodiChannelUid(int dispatcharrChannelId)
+  {
+    // The Dispatcharr client maps its internal ID back to a channel number,
+    // not to Kodi's client channel UID. Kodi's UID is the Xtream stream ID.
+    const int channelNumber = m_dispatcharrClient->GetKodiChannelUid(dispatcharrChannelId);
+    if (channelNumber <= 0)
+      return -1;
+
+    std::shared_ptr<const std::vector<xtream::LiveStream>> streams;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      streams = m_streams;
+    }
+
+    if (streams)
+    {
+      for (const auto& stream : *streams)
+      {
+        if (stream.number == channelNumber)
+          return stream.id;
+      }
+    }
+
+    kodi::Log(ADDON_LOG_WARNING,
+              "pvr.dispatcharr: No Kodi channel UID found for Dispatcharr channel %d (number %d)",
+              dispatcharrChannelId, channelNumber);
+    return -1;
+  }
+
   struct GroupMember
   {
     unsigned int channelUid = 0;
