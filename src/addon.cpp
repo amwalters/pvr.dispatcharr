@@ -621,19 +621,18 @@ public:
       }
 
       properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestPath);
-      properties.emplace_back(PVR_STREAM_PROPERTY_INPUTSTREAM, "inputstream.ffmpegdirect");
       properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/vnd.apple.mpegurl");
       properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
-      properties.emplace_back("inputstream.ffmpegdirect.open_mode", "ffmpeg");
-      properties.emplace_back("inputstream.ffmpegdirect.manifest_type", "hls");
-      properties.emplace_back("inputstream.ffmpegdirect.is_realtime_stream", "false");
+      kodi::Log(ADDON_LOG_INFO,
+                "pvr.dispatcharr: Prepared seekable active-recording manifest for recording %s",
+                recordingId.c_str());
     }
     else
     {
       properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, playback.url);
     }
 
-    // Do not log streamUrl: it contains the short-lived playback JWT.
+    // Do not log playback.url: it contains the short-lived playback JWT.
     kodi::Log(ADDON_LOG_DEBUG,
               "pvr.dispatcharr: Recording stream URL prepared for recording %s",
               recordingId.c_str());
