@@ -4,11 +4,13 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -710,6 +712,42 @@ bool Client::FetchRecordings(std::vector<Recording>& outRecordings)
           ExtractStringField(customProps, "status", r.status);
           // Extract poster_url for cover art
           ExtractStringField(customProps, "poster_url", r.iconPath);
+
+          std::string kodiEpgUid;
+          if (ExtractStringField(customProps, "kodi_epg_uid", kodiEpgUid)) {
+              const bool digitsOnly = !kodiEpgUid.empty() &&
+                  std::all_of(kodiEpgUid.begin(), kodiEpgUid.end(),
+                              [](unsigned char c) { return std::isdigit(c) != 0; });
+              errno = 0;
+              char* end = nullptr;
+              const unsigned long value = std::strtoul(kodiEpgUid.c_str(), &end, 10);
+              if (digitsOnly && errno == 0 && end && *end == '\0' &&
+                  value <= std::numeric_limits<unsigned int>::max()) {
+                  r.kodiEpgUid = static_cast<unsigned int>(value);
+              } else {
+                  kodi::Log(ADDON_LOG_WARNING,
+                            "pvr.dispatcharr: Invalid Kodi EPG UID for recording %d",
+                            r.id);
+              }
+          }
+
+          std::string kodiChannelUid;
+          if (ExtractStringField(customProps, "kodi_channel_uid", kodiChannelUid)) {
+              const bool digitsOnly = !kodiChannelUid.empty() &&
+                  std::all_of(kodiChannelUid.begin(), kodiChannelUid.end(),
+                              [](unsigned char c) { return std::isdigit(c) != 0; });
+              errno = 0;
+              char* end = nullptr;
+              const unsigned long value = std::strtoul(kodiChannelUid.c_str(), &end, 10);
+              if (digitsOnly && errno == 0 && end && *end == '\0' && value > 0 &&
+                  value <= static_cast<unsigned long>(std::numeric_limits<int>::max())) {
+                  r.kodiChannelUid = static_cast<int>(value);
+              } else {
+                  kodi::Log(ADDON_LOG_WARNING,
+                            "pvr.dispatcharr: Invalid Kodi channel UID for recording %d",
+                            r.id);
+              }
+          }
       }
       
       // Default to "scheduled" if status is missing (e.g. newly created recordings
@@ -774,14 +812,25 @@ bool Client::DeleteRecording(int id)
   return success;
 }
 
-bool Client::ScheduleRecording(int channelId, time_t startTime, time_t endTime, const std::string& title)
+bool Client::ScheduleRecording(int channelId,
+                               time_t startTime,
+                               time_t endTime,
+                               const std::string& title,
+                               unsigned int kodiEpgUid,
+                               int kodiChannelUid)
 {
   if (!EnsureToken()) return false;
   std::stringstream ss;
   ss << "{\"channel\":" << channelId 
      << ",\"start_time\":\"" << TimeToIso(startTime) << "\""
      << ",\"end_time\":\"" << TimeToIso(endTime) << "\""
-     << ",\"custom_properties\":{\"program\":{\"title\":\"" << JsonEscape(title) << "\"}} }";
+     << ",\"custom_properties\":{\"program\":{\"title\":\"" << JsonEscape(title) << "\"}";
+  if (kodiEpgUid != 0 && kodiChannelUid != 0)
+  {
+    ss << ",\"kodi_epg_uid\":\"" << kodiEpgUid << "\""
+       << ",\"kodi_channel_uid\":\"" << kodiChannelUid << "\"";
+  }
+  ss << "}}";
   
   auto resp = Request("POST", "/api/channels/recordings/", ss.str());
   // HTTP 201 Created is the correct success response for POST

@@ -47,6 +47,8 @@ struct Recording
   std::string iconPath; // poster_url from custom_properties
   time_t startTime = 0;
   time_t endTime = 0;
+  unsigned int kodiEpgUid = 0; // Kodi EPG event associated with this recording
+  int kodiChannelUid = 0; // Kodi channel associated with the EPG event
 };
 
 struct TokenResponse
@@ -92,7 +94,12 @@ public:
   bool FetchRecordings(std::vector<Recording>& outRecordings);
   bool GetRecordingStreamUrl(int id, std::string& outUrl);
   bool DeleteRecording(int id);
-  bool ScheduleRecording(int channelId, time_t startTime, time_t endTime, const std::string& title);
+  bool ScheduleRecording(int channelId,
+                         time_t startTime,
+                         time_t endTime,
+                         const std::string& title,
+                         unsigned int kodiEpgUid = 0,
+                         int kodiChannelUid = 0);
 
 private:
   DvrSettings m_settings;
