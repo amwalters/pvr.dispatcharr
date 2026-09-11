@@ -45,6 +45,9 @@
 
 namespace
 {
+constexpr auto kEpgRefreshInterval = std::chrono::minutes(60);
+constexpr auto kEpgRefreshRetryInterval = std::chrono::minutes(5);
+
 std::string Trim(std::string s)
 {
   auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -357,6 +360,7 @@ public:
     : CInstancePVRClient(instance)
   {
     kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: instance created");
+    StartEpgWorkerThread();
     StartBootstrapThread();
   }
 
@@ -364,10 +368,13 @@ public:
   {
     m_stopRequested = true;
     m_cv.notify_all();
+    m_epgCv.notify_all();
     if (m_bootstrap.joinable())
       m_bootstrap.join();
     if (m_worker.joinable())
       m_worker.join();
+    if (m_epgWorker.joinable())
+      m_epgWorker.join();
   }
 
   void SetSettingsOverride(const xtream::Settings& settings)
@@ -1171,6 +1178,7 @@ public:
   PVR_ERROR GetEPGForChannel(int channelUid, time_t start, time_t end, kodi::addon::PVREPGTagsResultSet& results) override
   {
     EnsureLoaded();
+    RequestEpgRefreshIfStale();
 
     std::shared_ptr<const std::vector<xtream::ChannelEpg>> epgData;
     std::shared_ptr<const UidToStreamMap> uidToStream;
@@ -1732,6 +1740,110 @@ private:
 
     (void)WriteStringToFileAtomic(path, blob);
   }
+
+  void StartEpgWorkerThread()
+  {
+    m_epgWorker = std::thread([this]() {
+      while (true)
+      {
+        uint64_t gen = 0;
+        xtream::Settings settings;
+        std::shared_ptr<const std::vector<xtream::LiveStream>> streams;
+
+        {
+          std::unique_lock<std::mutex> lock(m_mutex);
+          m_epgCv.wait(lock, [this]() { return m_stopRequested || m_epgRefreshRequested; });
+          if (m_stopRequested)
+            return;
+
+          m_epgRefreshRequested = false;
+          m_epgRefreshInProgress = true;
+          gen = m_generation.load();
+          settings = m_xtreamSettings;
+          streams = m_streams;
+        }
+
+        if (!streams)
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          m_epgRefreshInProgress = false;
+          continue;
+        }
+
+        std::string xmltvData;
+        const xtream::FetchResult fetchResult = xtream::FetchXMLTVEpg(settings, xmltvData);
+        std::vector<xtream::ChannelEpg> parsedEpg;
+        const bool parsed = fetchResult.ok && xtream::ParseXMLTV(xmltvData, *streams, parsedEpg);
+        std::vector<unsigned int> channelUids;
+
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          m_epgRefreshInProgress = false;
+
+          // A settings/channel reload invalidates results from an older request.
+          if (m_stopRequested || gen != m_generation.load())
+            continue;
+
+          if (parsed)
+          {
+            m_epgData = std::make_shared<std::vector<xtream::ChannelEpg>>(std::move(parsedEpg));
+            m_lastSuccessfulEpgRefresh = std::chrono::steady_clock::now();
+            if (m_uidToStreamId)
+            {
+              channelUids.reserve(m_uidToStreamId->size());
+              for (const auto& entry : *m_uidToStreamId)
+                channelUids.push_back(entry.first);
+            }
+          }
+        }
+
+        if (!fetchResult.ok)
+        {
+          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to refresh XMLTV EPG data: %s",
+                    fetchResult.details.c_str());
+          continue;
+        }
+        if (!parsed)
+        {
+          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to parse refreshed XMLTV data");
+          continue;
+        }
+
+        kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: refreshed EPG for %zu channels",
+                  channelUids.size());
+        // Kodi callbacks must not be made while holding m_mutex.
+        for (const unsigned int channelUid : channelUids)
+          TriggerEpgUpdate(channelUid);
+      }
+    });
+  }
+
+  void RequestEpgRefreshIfStale()
+  {
+    bool notify = false;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (m_stopRequested || !m_dataLoaded || !m_streams || m_epgRefreshInProgress ||
+          m_epgRefreshRequested)
+        return;
+
+      const auto now = std::chrono::steady_clock::now();
+      if (m_epgData && m_lastSuccessfulEpgRefresh != std::chrono::steady_clock::time_point{} &&
+          now - m_lastSuccessfulEpgRefresh < kEpgRefreshInterval)
+        return;
+      if (m_lastEpgRefreshAttempt != std::chrono::steady_clock::time_point{} &&
+          now - m_lastEpgRefreshAttempt < kEpgRefreshRetryInterval)
+        return;
+
+      m_lastEpgRefreshAttempt = now;
+      m_epgRefreshRequested = true;
+      notify = true;
+    }
+
+    if (notify)
+      m_epgCv.notify_one();
+  }
+
   void StartWorkerThread()
   {
     bool shouldStart = false;
@@ -2129,32 +2241,6 @@ private:
           m_groupsReady = true;
         }
 
-        // Load EPG data from XMLTV endpoint
-        std::string xmltvData;
-        const xtream::FetchResult epgResult = xtream::FetchXMLTVEpg(settings, xmltvData);
-        if (epgResult.ok)
-        {
-          kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: fetched XMLTV EPG data");
-          std::vector<xtream::ChannelEpg> epgData;
-          if (xtream::ParseXMLTV(xmltvData, streams, epgData))
-          {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_epgData = std::make_shared<std::vector<xtream::ChannelEpg>>(std::move(epgData));
-            
-            kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: loaded EPG for %zu channels",
-                      m_epgData ? m_epgData->size() : 0u);
-          }
-          else
-          {
-            kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to parse XMLTV data");
-          }
-        }
-        else
-        {
-          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to fetch XMLTV EPG data: %s", 
-                    epgResult.details.c_str());
-        }
-
         kodi::Log(ADDON_LOG_INFO,
                   "pvr.dispatcharr: loaded %zu channels in %zu categories (%lld ms)",
                   m_channels ? m_channels->size() : 0u, categories.size(), static_cast<long long>(ms));
@@ -2165,6 +2251,10 @@ private:
 
         // Best-effort cache write so startup can seed channels immediately.
         SaveCache(m_settingsSignature, categories, cacheChannels);
+
+        // EPG has its own refresh worker so XMLTV network/parsing work never blocks
+        // this channel loader or Kodi's PVR callback threads.
+        RequestEpgRefreshIfStale();
 
         // Always refresh groups after reload so Kodi drops stale groups/members.
         TriggerChannelUpdate();
@@ -2320,6 +2410,9 @@ private:
       m_loading = true;
       m_dataLoaded = false;
       m_groupsReady = false;
+      m_epgData.reset();
+      m_lastSuccessfulEpgRefresh = {};
+      m_lastEpgRefreshAttempt = {};
 
       m_xtreamSettings = std::move(xt);
 
@@ -2356,7 +2449,9 @@ private:
 
   std::mutex m_mutex;
   std::condition_variable m_cv;
+  std::condition_variable m_epgCv;
   std::thread m_worker;
+  std::thread m_epgWorker;
   std::thread m_bootstrap;
   std::atomic<bool> m_stopRequested{false};
   std::atomic<uint64_t> m_generation{0};
@@ -2366,6 +2461,10 @@ private:
   bool m_loading = false;
   bool m_dataLoaded = false;
   bool m_groupsReady = false;
+  bool m_epgRefreshRequested = false;
+  bool m_epgRefreshInProgress = false;
+  std::chrono::steady_clock::time_point m_lastSuccessfulEpgRefresh;
+  std::chrono::steady_clock::time_point m_lastEpgRefreshAttempt;
   std::string m_settingsSignature;
   bool m_hasSettingsOverride = false;
   xtream::Settings m_settingsOverride;
