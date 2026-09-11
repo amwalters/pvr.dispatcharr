@@ -202,18 +202,41 @@ std::string JsonEscape(const std::string& input)
 
 time_t ParseIsoTime(const std::string& iso)
 {
-  // 2026-01-23T10:00:00Z
-  if (iso.empty()) return 0;
+  // Dispatcharr returns timezone-aware ISO 8601 values. Convert them to UTC;
+  // mktime() would incorrectly interpret the fields in Kodi's local timezone.
+  if (iso.size() < 19)
+    return 0;
+
   struct tm tm = {};
-  if (iso.size() >= 19) {
-    sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", 
-           &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-           &tm.tm_hour, &tm.tm_min, &tm.tm_sec);
-    tm.tm_year -= 1900;
-    tm.tm_mon -= 1;
-    return mktime(&tm);
+  if (sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d",
+             &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+             &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6)
+    return 0;
+
+  tm.tm_year -= 1900;
+  tm.tm_mon -= 1;
+#ifdef _WIN32
+  time_t result = _mkgmtime(&tm);
+#else
+  time_t result = timegm(&tm);
+#endif
+  if (result == static_cast<time_t>(-1))
+    return 0;
+
+  // A positive offset means the wall clock is ahead of UTC, so subtract it.
+  if (iso.size() >= 25 && (iso[19] == '+' || iso[19] == '-') && iso[22] == ':')
+  {
+    int offsetHours = 0;
+    int offsetMinutes = 0;
+    if (sscanf(iso.c_str() + 20, "%2d:%2d", &offsetHours, &offsetMinutes) == 2 &&
+        offsetHours <= 23 && offsetMinutes <= 59)
+    {
+      const time_t offset = static_cast<time_t>(offsetHours * 3600 + offsetMinutes * 60);
+      result += (iso[19] == '+') ? -offset : offset;
+    }
   }
-  return 0;
+
+  return result;
 }
 
 std::string TimeToIso(time_t t)
