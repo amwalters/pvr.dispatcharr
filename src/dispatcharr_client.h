@@ -49,6 +49,13 @@ struct Recording
   time_t endTime = 0;
 };
 
+struct RecordingPlayback
+{
+  std::string url;
+  std::string playlist;
+  bool inProgress = false;
+};
+
 struct TokenResponse
 {
   std::string accessToken;
@@ -91,6 +98,7 @@ public:
   // Recordings
   bool FetchRecordings(std::vector<Recording>& outRecordings);
   bool GetRecordingStreamUrl(int id, std::string& outUrl);
+  bool GetRecordingPlayback(int id, RecordingPlayback& outPlayback);
   bool DeleteRecording(int id);
   bool ScheduleRecording(int channelId, time_t startTime, time_t endTime, const std::string& title);
 

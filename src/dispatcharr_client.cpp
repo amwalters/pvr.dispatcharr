@@ -749,7 +749,19 @@ bool Client::FetchRecordings(std::vector<Recording>& outRecordings)
 
 bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
 {
-  outUrl.clear();
+  RecordingPlayback playback;
+  if (!GetRecordingPlayback(id, playback))
+  {
+    outUrl.clear();
+    return false;
+  }
+  outUrl = std::move(playback.url);
+  return true;
+}
+
+bool Client::GetRecordingPlayback(int id, RecordingPlayback& outPlayback)
+{
+  outPlayback = {};
 
   // Refresh the recording list first. Besides confirming that the recording
   // still exists, this makes an authenticated request and therefore exercises
@@ -779,8 +791,55 @@ bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
   // Dispatcharr's recording file endpoint accepts JWT authentication through
   // the `token` query parameter for clients that cannot attach Authorization
   // headers to media requests.
-  outUrl = GetBaseUrl() + "/api/channels/recordings/" +
-           std::to_string(id) + "/file/?token=" + m_accessToken;
+  outPlayback.inProgress = it->status == "recording";
+  if (!outPlayback.inProgress)
+  {
+    outPlayback.url = GetBaseUrl() + "/api/channels/recordings/" +
+                      std::to_string(id) + "/file/?token=" + m_accessToken;
+    return true;
+  }
+
+  const auto playlistResponse = Request(
+      "GET", "/api/channels/recordings/" + std::to_string(id) + "/hls/index.m3u8");
+  if (playlistResponse.statusCode != 200 ||
+      playlistResponse.body.find("#EXTM3U") == std::string::npos)
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "pvr.dispatcharr: Failed to fetch active HLS playlist for recording %d",
+              id);
+    return false;
+  }
+
+  // Snapshot the currently recorded portion as VOD. Dispatcharr intentionally
+  // omits ENDLIST while recording, which makes FFmpeg start at the live edge
+  // and disables seeking even though the playlist contains every segment.
+  std::istringstream input(playlistResponse.body);
+  std::ostringstream output;
+  std::string line;
+  bool insertedPlaybackTags = false;
+  while (std::getline(input, line))
+  {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (!line.empty() && line.front() != '#' &&
+        (line.rfind("http://", 0) == 0 || line.rfind("https://", 0) == 0) &&
+        line.find("token=") == std::string::npos)
+    {
+      line += (line.find('?') == std::string::npos ? "?token=" : "&token=");
+      line += m_accessToken;
+    }
+    output << line << '\n';
+    if (!insertedPlaybackTags && line == "#EXTM3U")
+    {
+      output << "#EXT-X-PLAYLIST-TYPE:VOD\n"
+             << "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n";
+      insertedPlaybackTags = true;
+    }
+  }
+  if (playlistResponse.body.find("#EXT-X-ENDLIST") == std::string::npos)
+    output << "#EXT-X-ENDLIST\n";
+
+  outPlayback.playlist = output.str();
 
   return true;
 }
