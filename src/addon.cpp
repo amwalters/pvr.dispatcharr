@@ -514,9 +514,9 @@ public:
 
     for (const auto& r : recordings)
     {
-       // Only show completed recordings in the recordings list
-       // In-progress ("recording") might work but file may be incomplete
-       if (r.status != "completed" && r.status != "interrupted") 
+       // Active recordings are playable through Dispatcharr's HLS endpoint.
+       if (r.status != "completed" && r.status != "interrupted" &&
+           r.status != "recording")
          continue;
 
        kodi::addon::PVRRecording rec;
@@ -524,10 +524,15 @@ public:
        rec.SetTitle(r.title.empty() ? "Unknown Recording" : r.title);
        rec.SetPlot(r.plot);
        rec.SetRecordingTime(r.startTime);
-       int duration = static_cast<int>(r.endTime - r.startTime);
+       const time_t effectiveEnd = r.status == "recording"
+                                       ? std::min(std::time(nullptr), r.endTime)
+                                       : r.endTime;
+       int duration = static_cast<int>(effectiveEnd - r.startTime);
        rec.SetDuration(duration > 0 ? duration : 0);
        // Stream URL is provided via GetRecordingStreamProperties
-       rec.SetChannelUid(static_cast<int>(r.channelId));
+       const int kodiChannelUid = ResolveKodiChannelUid(r.channelId);
+       if (kodiChannelUid > 0)
+         rec.SetChannelUid(kodiChannelUid);
        // Set poster image if available
        if (!r.iconPath.empty()) {
            rec.SetIconPath(r.iconPath);
@@ -731,6 +736,7 @@ public:
 
       // 3. Scheduled Recordings (Type 1)
       std::vector<dispatcharr::Recording> recs;
+      bool hasActiveRecording = false;
       if (m_dispatcharrClient->FetchRecordings(recs)) {
           int timerCount = 0;
           for (const auto& r : recs) {
@@ -740,6 +746,8 @@ public:
                         r.id, r.status.c_str(), r.title.c_str(), r.channelId);
               if (r.status != "scheduled" && r.status != "recording") 
                   continue;
+              if (r.status == "recording")
+                  hasActiveRecording = true;
               timerCount++;
               
               kodi::addon::PVRTimer t;
@@ -766,6 +774,11 @@ public:
           }
           kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers - fetched %zu recordings, %d as timers", recs.size(), timerCount);
       }
+
+      // A Dispatcharr recording can transition asynchronously after AddTimer().
+      // Once its timer reports "recording", ask Kodi to import the playable item.
+      if (hasActiveRecording)
+          TriggerRecordingUpdate();
       
       kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers complete");
       return PVR_ERROR_NO_ERROR;
@@ -900,6 +913,7 @@ public:
           if (m_dispatcharrClient->ScheduleRecording(dispatchChannelId, timer.GetStartTime(), timer.GetEndTime(), timer.GetTitle())) {
               kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: AddTimer (one-shot) - Dispatcharr API returned success, calling TriggerTimerUpdate");
               TriggerTimerUpdate();
+              TriggerRecordingUpdate();
               return PVR_ERROR_NO_ERROR;
           } else {
               kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: AddTimer (one-shot) - Dispatcharr API returned failure");
@@ -1546,6 +1560,35 @@ public:
   }
 
 private:
+  int ResolveKodiChannelUid(int dispatcharrChannelId)
+  {
+    // The Dispatcharr client maps its internal ID to the provider channel
+    // number. Kodi's client channel UID is the Xtream stream ID.
+    const int channelNumber = m_dispatcharrClient->GetKodiChannelUid(dispatcharrChannelId);
+    if (channelNumber <= 0)
+      return -1;
+
+    std::shared_ptr<const std::vector<xtream::LiveStream>> streams;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      streams = m_streams;
+    }
+
+    if (streams)
+    {
+      for (const auto& stream : *streams)
+      {
+        if (stream.number == channelNumber)
+          return stream.id;
+      }
+    }
+
+    kodi::Log(ADDON_LOG_WARNING,
+              "pvr.dispatcharr: No Kodi channel UID found for Dispatcharr channel %d (number %d)",
+              dispatcharrChannelId, channelNumber);
+    return -1;
+  }
+
   struct GroupMember
   {
     unsigned int channelUid = 0;
