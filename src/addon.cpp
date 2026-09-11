@@ -126,6 +126,14 @@ std::string TranslateSpecial(const std::string& url)
   }
 }
 
+std::string LocalPathToFileUrl(std::string path)
+{
+  std::replace(path.begin(), path.end(), '\\', '/');
+  if (!path.empty() && path.front() == '/')
+    return "file://" + path;
+  return "file:///" + path;
+}
+
 constexpr uint32_t kCacheMagic = 0x31435458; // 'XTC1' little-endian
 
 void AppendU32(std::string& out, uint32_t v)
@@ -621,9 +629,10 @@ public:
         return PVR_ERROR_FAILED;
       }
 
-      // Return the Kodi VFS URL, not its platform-specific translated path.
-      // The latter is suitable for std::ofstream but is not a portable media URL.
-      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestUrl);
+      // PVR stream properties require a concrete media URL. `special://` is a
+      // Kodi VFS alias, but is rejected here before VideoPlayer is started.
+      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL,
+                              LocalPathToFileUrl(manifestPath));
       properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/vnd.apple.mpegurl");
       properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
       kodi::Log(ADDON_LOG_INFO,
