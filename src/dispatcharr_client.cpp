@@ -330,6 +330,7 @@ Client::HttpResponse Client::Request(const std::string& method,
                                      const std::string& jsonBody,
                                      bool retryAuth)
 {
+  std::lock_guard<std::recursive_mutex> requestLock(m_requestMutex);
   HttpResponse resp;
   std::string url = GetBaseUrl() + endpoint;
   
@@ -387,7 +388,8 @@ Client::HttpResponse Client::Request(const std::string& method,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     resp.statusCode = static_cast<int>(httpCode);
     kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response code: %d", resp.statusCode);
-    kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response: %s", resp.body.substr(0, 500).c_str());
+    if (endpoint.find("/hls/seg_") == std::string::npos)
+      kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response: %s", resp.body.substr(0, 500).c_str());
   } else {
     kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: curl_easy_perform failed: %s", curl_easy_strerror(res));
     resp.statusCode = 0;
@@ -413,6 +415,7 @@ Client::HttpResponse Client::Request(const std::string& method,
 
 bool Client::EnsureToken()
 {
+  std::lock_guard<std::recursive_mutex> requestLock(m_requestMutex);
   if (!m_accessToken.empty()) return true;
   
   std::stringstream ss;
@@ -756,6 +759,75 @@ bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
     return false;
   }
   outUrl = std::move(playback.url);
+  return true;
+}
+
+bool Client::GetRecording(int id, Recording& outRecording)
+{
+  std::vector<Recording> recordings;
+  if (!FetchRecordings(recordings))
+    return false;
+  const auto it = std::find_if(recordings.begin(), recordings.end(),
+                               [id](const Recording& value) { return value.id == id; });
+  if (it == recordings.end())
+    return false;
+  outRecording = *it;
+  return true;
+}
+
+bool Client::FetchActiveRecordingManifest(int id, std::string& outManifest)
+{
+  outManifest.clear();
+  if (!EnsureToken())
+    return false;
+  const auto response = Request(
+      "GET", "/api/channels/recordings/" + std::to_string(id) + "/hls/index.m3u8");
+  if (response.statusCode != 200 || response.body.find("#EXTM3U") == std::string::npos)
+    return false;
+  outManifest = response.body;
+  return true;
+}
+
+bool Client::DownloadRecordingSegment(int id, const std::string& uri, std::string& outData)
+{
+  outData.clear();
+  if (!EnsureToken())
+    return false;
+
+  std::string endpoint = uri;
+  if (endpoint.rfind("http://", 0) == 0 || endpoint.rfind("https://", 0) == 0)
+  {
+    // Dispatcharr may advertise its public URL without the explicit/default
+    // port present in the add-on setting. Extract only the path and fetch it
+    // from our configured server, so credentials can never be sent to the
+    // playlist-provided authority.
+    const size_t scheme = endpoint.find("://");
+    const size_t path = endpoint.find('/', scheme + 3);
+    if (path == std::string::npos)
+      return false;
+    endpoint.erase(0, path);
+  }
+  else if (endpoint.empty() || endpoint.front() != '/')
+    endpoint = "/api/channels/recordings/" + std::to_string(id) + "/hls/" + endpoint;
+
+  // Authorization headers are refreshed automatically by Request(). Discard
+  // any short-lived token copied into the playlist URI.
+  const size_t query = endpoint.find('?');
+  if (query != std::string::npos)
+    endpoint.erase(query);
+  const std::string allowedPrefix = "/api/channels/recordings/" +
+                                    std::to_string(id) + "/hls/";
+  if (endpoint.rfind(allowedPrefix, 0) != 0 || endpoint.find("..") != std::string::npos)
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "pvr.dispatcharr: Refusing unexpected recording segment path '%s'",
+              endpoint.c_str());
+    return false;
+  }
+  const auto response = Request("GET", endpoint);
+  if (response.statusCode != 200 || response.body.empty())
+    return false;
+  outData = response.body;
   return true;
 }
 

@@ -22,6 +22,7 @@
 
 #include "xtream_client.h"
 #include "dispatcharr_client.h"
+#include "recording/growing_recorded_stream.h"
 
 // Platform-specific time functions
 #ifdef _WIN32
@@ -359,12 +360,18 @@ public:
     : CInstancePVRClient(instance)
   {
     kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: instance created");
+    const std::string cacheDirectory =
+        TranslateSpecial("special://temp/pvr.dispatcharr/recorded-stream");
+    if (!cacheDirectory.empty())
+      dispatcharr::recording::GrowingRecordedStream::CleanupStaleFiles(cacheDirectory);
     StartRecordingMonitorThread();
     StartBootstrapThread();
   }
 
   ~CXtreamCodesPVRClient() override
   {
+    if (m_growingRecording)
+      m_growingRecording->Close();
     m_stopRequested = true;
     m_cv.notify_all();
     m_recordingCv.notify_all();
@@ -587,8 +594,8 @@ public:
       return PVR_ERROR_INVALID_PARAMETERS;
     }
 
-    dispatcharr::RecordingPlayback playback;
-    if (!m_dispatcharrClient->GetRecordingPlayback(id, playback))
+    dispatcharr::Recording recordingInfo;
+    if (!m_dispatcharrClient->GetRecording(id, recordingInfo))
     {
       kodi::Log(ADDON_LOG_ERROR,
                 "pvr.dispatcharr: Failed to prepare playback for recording %s",
@@ -596,34 +603,24 @@ public:
       return PVR_ERROR_SERVER_ERROR;
     }
 
-    if (playback.inProgress)
+    if (recordingInfo.status == "recording")
     {
-      const std::string manifestUrl =
-          "special://temp/pvr.dispatcharr/recording-" +
-          std::to_string(id) + ".m3u8";
-      const std::string manifestPath = TranslateSpecial(manifestUrl);
-      if (manifestPath.empty() ||
-          !WriteStringToFileAtomic(manifestPath, playback.playlist))
-      {
-        kodi::Log(ADDON_LOG_ERROR,
-                  "pvr.dispatcharr: Failed to write playback manifest for recording %d",
-                  id);
-        return PVR_ERROR_FAILED;
-      }
-
-      // Hand the translated local path to Kodi's native HLS player. This is
-      // the same form Kodi accepts through PlayMedia for this VOD snapshot.
-      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, manifestPath);
-      properties.emplace_back(PVR_STREAM_PROPERTY_MIMETYPE, "application/vnd.apple.mpegurl");
-      properties.emplace_back(PVR_STREAM_PROPERTY_ISREALTIMESTREAM, "false");
+      // An empty URL deliberately selects Kodi's native recorded-stream API.
       kodi::Log(ADDON_LOG_INFO,
-                "pvr.dispatcharr: Prepared seekable active-recording manifest for recording %s",
+                "pvr.dispatcharr: Selected growing native stream for active recording %s",
                 recordingId.c_str());
+      return PVR_ERROR_NO_ERROR;
     }
-    else
+
+    dispatcharr::RecordingPlayback playback;
+    if (!m_dispatcharrClient->GetRecordingPlayback(id, playback))
     {
-      properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, playback.url);
+      kodi::Log(ADDON_LOG_ERROR,
+                "pvr.dispatcharr: Failed to prepare completed recording %s",
+                recordingId.c_str());
+      return PVR_ERROR_SERVER_ERROR;
     }
+    properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, playback.url);
 
     // Do not log playback.url: it contains the short-lived playback JWT.
     kodi::Log(ADDON_LOG_DEBUG,
@@ -631,6 +628,48 @@ public:
               recordingId.c_str());
 
     return PVR_ERROR_NO_ERROR;
+  }
+
+  bool OpenRecordedStream(const kodi::addon::PVRRecording& recording) override
+  {
+    if (!m_dispatcharrClient)
+      return false;
+    int id = 0;
+    try { id = std::stoi(recording.GetRecordingId()); }
+    catch (...) { return false; }
+
+    dispatcharr::Recording info;
+    if (!m_dispatcharrClient->GetRecording(id, info) || info.status != "recording")
+      return false;
+    const std::string cacheDirectory =
+        TranslateSpecial("special://temp/pvr.dispatcharr/recorded-stream");
+    if (cacheDirectory.empty())
+      return false;
+    if (!m_growingRecording)
+      m_growingRecording = std::make_unique<dispatcharr::recording::GrowingRecordedStream>(
+          *m_dispatcharrClient);
+    return m_growingRecording->Open(id, cacheDirectory);
+  }
+
+  void CloseRecordedStream() override
+  {
+    if (m_growingRecording)
+      m_growingRecording->Close();
+  }
+
+  int ReadRecordedStream(unsigned char* buffer, unsigned int size) override
+  {
+    return m_growingRecording ? m_growingRecording->Read(buffer, size) : -1;
+  }
+
+  int64_t SeekRecordedStream(int64_t position, int whence) override
+  {
+    return m_growingRecording ? m_growingRecording->Seek(position, whence) : -1;
+  }
+
+  int64_t LengthRecordedStream() override
+  {
+    return m_growingRecording ? m_growingRecording->Length() : -1;
   }
 
   PVR_ERROR GetTimerTypes(std::vector<kodi::addon::PVRTimerType>& types) override
@@ -1354,13 +1393,27 @@ public:
 
   bool CanSeekStream() override
   {
+    if (m_growingRecording && m_growingRecording->IsOpen())
+      return true;
     // Catchup streams support seeking via HTTP range requests
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
   }
 
+  bool CanPauseStream() override
+  {
+    return m_growingRecording && m_growingRecording->IsOpen();
+  }
+
+  void PauseStream(bool paused) override
+  {
+    (void)paused;
+  }
+
   bool IsRealTimeStream() override
   {
+    if (m_growingRecording && m_growingRecording->IsOpen())
+      return false;
     // When playing catchup, this is NOT a realtime stream
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_activeCatchupChannelUid == 0;
@@ -1368,6 +1421,14 @@ public:
 
   PVR_ERROR GetStreamTimes(kodi::addon::PVRStreamTimes& times) override
   {
+    if (m_growingRecording && m_growingRecording->IsOpen())
+    {
+      times.SetStartTime(0);
+      times.SetPTSStart(0);
+      times.SetPTSBegin(0);
+      times.SetPTSEnd(m_growingRecording->DurationMicroseconds());
+      return PVR_ERROR_NO_ERROR;
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
     
     // Check if we have an active catchup stream
@@ -2528,6 +2589,7 @@ private:
   xtream::Settings m_settingsOverride;
   xtream::Settings m_xtreamSettings;
   std::unique_ptr<dispatcharr::Client> m_dispatcharrClient;
+  std::unique_ptr<dispatcharr::recording::GrowingRecordedStream> m_growingRecording;
   std::string m_streamFormat;
   std::string m_channelNumbering;
   std::string m_filterPatternsRaw;
