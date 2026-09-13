@@ -23,6 +23,12 @@ if(BUILD_TESTING)
   )
   target_include_directories(hls_playlist_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
   add_test(NAME hls_playlist_test COMMAND hls_playlist_test)
+  add_executable(epg_recording_match_test
+    tests/epg_recording_match_test.cpp
+    src/recording/epg_recording_match.cpp
+  )
+  target_include_directories(epg_recording_match_test PRIVATE "${CMAKE_SOURCE_DIR}/src")
+  add_test(NAME epg_recording_match_test COMMAND epg_recording_match_test)
 endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${PROJECT_SOURCE_DIR})
@@ -89,6 +95,7 @@ if(Kodi_FOUND)
     src/dispatcharr_client.cpp
     src/recording/hls_playlist.cpp
     src/recording/growing_recorded_stream.cpp
+    src/recording/epg_recording_match.cpp
   )
 
   set(XTC_HEADERS
@@ -150,6 +157,7 @@ else()
       src/dispatcharr_client.cpp
       src/recording/hls_playlist.cpp
       src/recording/growing_recorded_stream.cpp
+      src/recording/epg_recording_match.cpp
       src/pugixml/pugixml.cpp
     )
   else()
@@ -159,6 +167,7 @@ else()
       src/dispatcharr_client.cpp
       src/recording/hls_playlist.cpp
       src/recording/growing_recorded_stream.cpp
+      src/recording/epg_recording_match.cpp
       src/pugixml/pugixml.cpp
     )
   endif()

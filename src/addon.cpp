@@ -23,6 +23,7 @@
 #include "xtream_client.h"
 #include "dispatcharr_client.h"
 #include "recording/growing_recorded_stream.h"
+#include "recording/epg_recording_match.h"
 
 // Platform-specific time functions
 #ifdef _WIN32
@@ -554,8 +555,11 @@ public:
                                       : ResolveKodiChannelUid(r.channelId);
        if (kodiChannelUid > 0)
          rec.SetChannelUid(kodiChannelUid);
-       if (r.kodiEpgUid != EPG_TAG_INVALID_UID)
-         rec.SetEPGEventId(r.kodiEpgUid);
+       const unsigned int kodiEpgUid = r.kodiEpgUid != EPG_TAG_INVALID_UID
+                                           ? r.kodiEpgUid
+                                           : ResolveRecordingEpgUid(r, kodiChannelUid);
+       if (kodiEpgUid != EPG_TAG_INVALID_UID)
+         rec.SetEPGEventId(kodiEpgUid);
        // Set poster image if available
        if (!r.iconPath.empty()) {
            rec.SetIconPath(r.iconPath);
@@ -833,16 +837,19 @@ public:
               // Use the recording ID offset by 30000 to avoid collision
               t.SetClientIndex(static_cast<unsigned int>(30000 + r.id));
               t.SetTitle(r.title);
-              if (r.kodiEpgUid != EPG_TAG_INVALID_UID) {
+              const int kodiUid = r.kodiChannelUid != 0
+                                      ? r.kodiChannelUid
+                                      : ResolveKodiChannelUid(r.channelId);
+              const unsigned int kodiEpgUid = r.kodiEpgUid != EPG_TAG_INVALID_UID
+                                                  ? r.kodiEpgUid
+                                                  : ResolveRecordingEpgUid(r, kodiUid);
+              if (kodiEpgUid != EPG_TAG_INVALID_UID) {
                   t.SetTimerType(4);
-                  t.SetEPGUid(r.kodiEpgUid);
+                  t.SetEPGUid(kodiEpgUid);
               } else {
                   t.SetTimerType(1);
               }
               // Map Dispatcharr channel ID back to Kodi channel UID
-              int kodiUid = r.kodiChannelUid != 0
-                                ? r.kodiChannelUid
-                                : ResolveKodiChannelUid(r.channelId);
               kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers - recording id=%d mapped channel %d -> kodiUid %d",
                         r.id, r.channelId, kodiUid);
               if (kodiUid > 0) {
@@ -1679,6 +1686,26 @@ public:
   }
 
 private:
+  unsigned int ResolveRecordingEpgUid(const dispatcharr::Recording& recording,
+                                      int kodiChannelUid)
+  {
+    std::shared_ptr<const std::vector<xtream::ChannelEpg>> epgData;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      epgData = m_epgData;
+    }
+    if (!epgData)
+      return EPG_TAG_INVALID_UID;
+
+    const unsigned int uid = dispatcharr::recording::MatchRecordingToEpg(
+        *epgData, kodiChannelUid, recording.startTime, recording.endTime, recording.title);
+    if (uid != EPG_TAG_INVALID_UID)
+      kodi::Log(ADDON_LOG_INFO,
+                "pvr.dispatcharr: Matched external recording %d to Kodi EPG event %u on channel %d",
+                recording.id, uid, kodiChannelUid);
+    return uid;
+  }
+
   int ResolveKodiChannelUid(int dispatcharrChannelId)
   {
     // The Dispatcharr client maps its internal ID back to a channel number,
