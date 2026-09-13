@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <ctime>
 
 namespace dispatcharr
@@ -101,6 +102,9 @@ public:
   bool FetchRecordings(std::vector<Recording>& outRecordings);
   bool GetRecordingStreamUrl(int id, std::string& outUrl);
   bool GetRecordingPlayback(int id, RecordingPlayback& outPlayback);
+  bool GetRecording(int id, Recording& outRecording);
+  bool FetchActiveRecordingManifest(int id, std::string& outManifest);
+  bool DownloadRecordingSegment(int id, const std::string& uri, std::string& outData);
   bool DeleteRecording(int id);
   bool ScheduleRecording(int channelId,
                          time_t startTime,
@@ -112,6 +116,7 @@ public:
 private:
   DvrSettings m_settings;
   std::string m_accessToken;
+  std::recursive_mutex m_requestMutex;
   std::map<int, int> m_channelNumberToDispatchId;  // Maps channel number to Dispatcharr ID
   std::map<int, int> m_dispatchIdToChannelNumber;  // Maps Dispatcharr ID to channel number (Kodi UID)
   std::map<int, std::string> m_kodiUidToDispatchTvgId; // Maps Kodi UID to Dispatcharr tvg_id
