@@ -33,7 +33,10 @@
 namespace
 {
 constexpr const char* kDefaultAddonUserAgent = "DispatcharrKodiAddon";
-constexpr size_t kMaxHttpBodyBytes = 50 * 1024 * 1024; // cap responses to protect memory (XMLTV can be large)
+constexpr size_t kMaxHttpBodyBytes = 50 * 1024 * 1024; // cap JSON API responses to protect memory
+// XMLTV guides legitimately run much larger than JSON API responses (many
+// channels x many days of uncompressed program data). Their ceiling is
+// user-configurable (Settings::xmltvMaxSizeMb) rather than a fixed constant.
 
 std::string Trim(std::string s)
 {
@@ -564,7 +567,8 @@ bool ExtractSettingBool(const std::string& xml, const char* id, bool& out)
 
 HttpResult HttpGet(const std::string& url,
                    const std::string& userAgent,
-                   int timeoutSeconds)
+                   int timeoutSeconds,
+                   size_t maxBodyBytes = kMaxHttpBodyBytes)
 {
   HttpResult result;
 
@@ -591,10 +595,10 @@ HttpResult HttpGet(const std::string& url,
     return result;
 
   result.protocol = file.GetPropertyValue(ADDON_FILE_PROPERTY_RESPONSE_PROTOCOL, "");
-  if (!ReadAll(file, result.body, kMaxHttpBodyBytes))
+  if (!ReadAll(file, result.body, maxBodyBytes))
   {
     kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: HTTP response exceeded %zu bytes for %s",
-              kMaxHttpBodyBytes, redacted.c_str());
+              maxBodyBytes, redacted.c_str());
     result.protocol = result.protocol.empty() ? std::string("Body too large") : result.protocol;
     return result;
   }
@@ -1029,6 +1033,7 @@ Settings LoadSettings()
   kodi::addon::GetSettingString("custom_user_agent", s.customUserAgent);
   kodi::addon::GetSettingBoolean("enable_play_from_start", s.enablePlayFromStart);
   kodi::addon::GetSettingBoolean("use_ffmpegdirect", s.useFFmpegDirect);
+  kodi::addon::GetSettingInt("xmltv_max_size_mb", s.xmltvMaxSizeMb);
 
   // Kodi sometimes doesn't transfer settings to binary addons early during startup.
   // Always read persisted settings.xml from addon_data and overlay any values found.
@@ -1053,6 +1058,7 @@ Settings LoadSettings()
         s.customUserAgent = tmp;
       ExtractSettingBool(xml, "enable_play_from_start", s.enablePlayFromStart);
       ExtractSettingBool(xml, "use_ffmpegdirect", s.useFFmpegDirect);
+      ExtractSettingInt(xml, "xmltv_max_size_mb", s.xmltvMaxSizeMb);
     }
   }
   return s;
@@ -1281,8 +1287,10 @@ FetchResult FetchXMLTVEpg(const Settings& settings, std::string& xmltvData)
                     "&password=" + UrlEncode(settings.password);
 
   const std::string ua = EffectiveUserAgent(settings);
-  const HttpResult http = HttpGet(url, ua, settings.timeoutSeconds);
-  
+  const int configuredMb = settings.xmltvMaxSizeMb > 0 ? settings.xmltvMaxSizeMb : 300;
+  const size_t maxBytes = static_cast<size_t>(configuredMb) * 1024 * 1024;
+  const HttpResult http = HttpGet(url, ua, settings.timeoutSeconds, maxBytes);
+
   if (!http.ok)
     return {false, http.protocol.empty() ? std::string("Failed to fetch XMLTV") : http.protocol};
 

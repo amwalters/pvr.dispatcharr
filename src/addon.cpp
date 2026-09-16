@@ -2828,6 +2828,8 @@ public:
       m_cachedSettings.enableUserAgentSpoofing = settingValue.GetBoolean();
     else if (settingName == "custom_user_agent")
       m_cachedSettings.customUserAgent = settingValue.GetString();
+    else if (settingName == "xmltv_max_size_mb")
+      m_cachedSettings.xmltvMaxSizeMb = settingValue.GetInt();
 
     m_hasCachedSettings = true;
 
