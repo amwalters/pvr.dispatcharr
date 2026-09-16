@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hls_playlist.h"
+#include "recorded_stream.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -15,23 +16,23 @@ namespace dispatcharr { class Client; }
 namespace dispatcharr::recording
 {
 
-class GrowingRecordedStream
+class GrowingRecordedStream : public IRecordedStream
 {
 public:
   explicit GrowingRecordedStream(Client& client);
-  ~GrowingRecordedStream();
+  ~GrowingRecordedStream() override;
 
   GrowingRecordedStream(const GrowingRecordedStream&) = delete;
   GrowingRecordedStream& operator=(const GrowingRecordedStream&) = delete;
 
   static void CleanupStaleFiles(const std::string& directory);
   bool Open(int recordingId, const std::string& cacheDirectory);
-  void Close();
-  int Read(unsigned char* buffer, unsigned int size);
-  int64_t Seek(int64_t offset, int whence);
-  int64_t Length() const;
-  int64_t DurationMicroseconds() const;
-  bool IsOpen() const;
+  void Close() override;
+  int Read(unsigned char* buffer, unsigned int size) override;
+  int64_t Seek(int64_t offset, int whence) override;
+  int64_t Length() const override;
+  int64_t DurationMicroseconds() const override;
+  bool IsOpen() const override;
 
 private:
   bool RefreshAndDownload(size_t maximumNewSegments = 0);

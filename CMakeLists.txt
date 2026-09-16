@@ -96,6 +96,7 @@ if(Kodi_FOUND)
     src/recording/hls_playlist.cpp
     src/recording/growing_recorded_stream.cpp
     src/recording/epg_recording_match.cpp
+    src/recording/remote_file_recorded_stream.cpp
   )
 
   set(XTC_HEADERS
@@ -158,6 +159,7 @@ else()
       src/recording/hls_playlist.cpp
       src/recording/growing_recorded_stream.cpp
       src/recording/epg_recording_match.cpp
+      src/recording/remote_file_recorded_stream.cpp
       src/pugixml/pugixml.cpp
     )
   else()
@@ -168,6 +170,7 @@ else()
       src/recording/hls_playlist.cpp
       src/recording/growing_recorded_stream.cpp
       src/recording/epg_recording_match.cpp
+      src/recording/remote_file_recorded_stream.cpp
       src/pugixml/pugixml.cpp
     )
   endif()

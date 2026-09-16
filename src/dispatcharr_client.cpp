@@ -27,6 +27,14 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
   return totalSize;
 }
 
+static size_t HeaderCallback(char* buffer, size_t size, size_t nitems, void* userp)
+{
+  size_t totalSize = size * nitems;
+  std::string* str = static_cast<std::string*>(userp);
+  str->append(buffer, totalSize);
+  return totalSize;
+}
+
 } // anonymous namespace
 
 namespace dispatcharr
@@ -330,7 +338,8 @@ std::string Client::GetBaseUrl() const
 Client::HttpResponse Client::Request(const std::string& method,
                                      const std::string& endpoint,
                                      const std::string& jsonBody,
-                                     bool retryAuth)
+                                     bool retryAuth,
+                                     const std::string& rangeHeader)
 {
   std::lock_guard<std::recursive_mutex> requestLock(m_requestMutex);
   HttpResponse resp;
@@ -357,7 +366,9 @@ Client::HttpResponse Client::Request(const std::string& method,
   // Set write callback
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
-  
+  curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+  curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp.headers);
+
   // Set headers
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -365,6 +376,10 @@ Client::HttpResponse Client::Request(const std::string& method,
   if (!m_accessToken.empty()) {
     std::string authHeader = "Authorization: Bearer " + m_accessToken;
     headers = curl_slist_append(headers, authHeader.c_str());
+  }
+  if (!rangeHeader.empty()) {
+    std::string rangeHeaderLine = "Range: " + rangeHeader;
+    headers = curl_slist_append(headers, rangeHeaderLine.c_str());
   }
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   
@@ -390,7 +405,7 @@ Client::HttpResponse Client::Request(const std::string& method,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     resp.statusCode = static_cast<int>(httpCode);
     kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response code: %d", resp.statusCode);
-    if (endpoint.find("/hls/seg_") == std::string::npos)
+    if (endpoint.find("/hls/seg_") == std::string::npos && rangeHeader.empty())
       kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response: %s", resp.body.substr(0, 500).c_str());
   } else {
     kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: curl_easy_perform failed: %s", curl_easy_strerror(res));
@@ -409,7 +424,7 @@ Client::HttpResponse Client::Request(const std::string& method,
     m_accessToken.clear();
 
     if (EnsureToken())
-      return Request(method, endpoint, jsonBody, false);
+      return Request(method, endpoint, jsonBody, false, rangeHeader);
   }
   
   return resp;
@@ -788,18 +803,6 @@ bool Client::FetchRecordings(std::vector<Recording>& outRecordings)
   return true;
 }
 
-bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
-{
-  RecordingPlayback playback;
-  if (!GetRecordingPlayback(id, playback))
-  {
-    outUrl.clear();
-    return false;
-  }
-  outUrl = std::move(playback.url);
-  return true;
-}
-
 bool Client::GetRecording(int id, Recording& outRecording)
 {
   std::vector<Recording> recordings;
@@ -869,88 +872,44 @@ bool Client::DownloadRecordingSegment(int id, const std::string& uri, std::strin
   return true;
 }
 
-bool Client::GetRecordingPlayback(int id, RecordingPlayback& outPlayback)
+bool Client::FetchRecordingFileRange(int id, int64_t offset, int64_t length,
+                                     std::string& outData, int64_t& outTotalLength)
 {
-  outPlayback = {};
-
-  // Refresh the recording list first. Besides confirming that the recording
-  // still exists, this makes an authenticated request and therefore exercises
-  // Request()'s 401 re-authentication path if the cached access token expired.
-  std::vector<Recording> recordings;
-  if (!FetchRecordings(recordings))
+  outData.clear();
+  outTotalLength = 0;
+  if (length <= 0)
+    return false;
+  if (!EnsureToken())
     return false;
 
-  const auto it = std::find_if(
-      recordings.begin(), recordings.end(),
-      [id](const Recording& recording) { return recording.id == id; });
-
-  if (it == recordings.end())
-  {
-    kodi::Log(ADDON_LOG_WARNING,
-              "pvr.dispatcharr: Recording %d not found", id);
+  std::ostringstream range;
+  range << "bytes=" << offset << "-" << (offset + length - 1);
+  const auto response = Request(
+      "GET", "/api/channels/recordings/" + std::to_string(id) + "/file/", "", true, range.str());
+  if (response.statusCode != 200 && response.statusCode != 206)
     return false;
-  }
 
-  if (m_accessToken.empty())
+  // Parse "Content-Range: bytes 0-0/12345" to learn the recording's total
+  // size. std::stoll stops at the first non-digit character, so trailing
+  // "\r\n" and any headers after it are harmlessly ignored.
+  const size_t headerPos = response.headers.find("Content-Range:");
+  if (headerPos != std::string::npos)
   {
-    kodi::Log(ADDON_LOG_ERROR,
-              "pvr.dispatcharr: Cannot create recording playback URL without authentication");
-    return false;
-  }
-
-  // Dispatcharr's recording file endpoint accepts JWT authentication through
-  // the `token` query parameter for clients that cannot attach Authorization
-  // headers to media requests.
-  outPlayback.inProgress = it->status == "recording";
-  if (!outPlayback.inProgress)
-  {
-    outPlayback.url = GetBaseUrl() + "/api/channels/recordings/" +
-                      std::to_string(id) + "/file/?token=" + m_accessToken;
-    return true;
-  }
-
-  const auto playlistResponse = Request(
-      "GET", "/api/channels/recordings/" + std::to_string(id) + "/hls/index.m3u8");
-  if (playlistResponse.statusCode != 200 ||
-      playlistResponse.body.find("#EXTM3U") == std::string::npos)
-  {
-    kodi::Log(ADDON_LOG_ERROR,
-              "pvr.dispatcharr: Failed to fetch active HLS playlist for recording %d",
-              id);
-    return false;
-  }
-
-  // Snapshot the currently recorded portion as VOD. Dispatcharr intentionally
-  // omits ENDLIST while recording, which makes FFmpeg start at the live edge
-  // and disables seeking even though the playlist contains every segment.
-  std::istringstream input(playlistResponse.body);
-  std::ostringstream output;
-  std::string line;
-  bool insertedPlaybackTags = false;
-  while (std::getline(input, line))
-  {
-    if (!line.empty() && line.back() == '\r')
-      line.pop_back();
-    if (!line.empty() && line.front() != '#' &&
-        (line.rfind("http://", 0) == 0 || line.rfind("https://", 0) == 0) &&
-        line.find("token=") == std::string::npos)
+    const size_t slash = response.headers.find('/', headerPos);
+    if (slash != std::string::npos)
     {
-      line += (line.find('?') == std::string::npos ? "?token=" : "&token=");
-      line += m_accessToken;
-    }
-    output << line << '\n';
-    if (!insertedPlaybackTags && line == "#EXTM3U")
-    {
-      output << "#EXT-X-PLAYLIST-TYPE:VOD\n"
-             << "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n";
-      insertedPlaybackTags = true;
+      try { outTotalLength = std::stoll(response.headers.substr(slash + 1)); }
+      catch (...) { outTotalLength = 0; }
     }
   }
-  if (playlistResponse.body.find("#EXT-X-ENDLIST") == std::string::npos)
-    output << "#EXT-X-ENDLIST\n";
+  if (outTotalLength <= 0)
+  {
+    // Server ignored the Range request (e.g. HTTP 200) and returned the
+    // whole file; treat what we got as the complete recording.
+    outTotalLength = static_cast<int64_t>(response.body.size());
+  }
 
-  outPlayback.playlist = output.str();
-
+  outData = std::move(response.body);
   return true;
 }
 

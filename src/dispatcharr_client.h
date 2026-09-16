@@ -52,13 +52,6 @@ struct Recording
   int kodiChannelUid = 0; // Kodi channel associated with the EPG event
 };
 
-struct RecordingPlayback
-{
-  std::string url;
-  std::string playlist;
-  bool inProgress = false;
-};
-
 struct TokenResponse
 {
   std::string accessToken;
@@ -100,11 +93,15 @@ public:
 
   // Recordings
   bool FetchRecordings(std::vector<Recording>& outRecordings);
-  bool GetRecordingStreamUrl(int id, std::string& outUrl);
-  bool GetRecordingPlayback(int id, RecordingPlayback& outPlayback);
   bool GetRecording(int id, Recording& outRecording);
   bool FetchActiveRecordingManifest(int id, std::string& outManifest);
   bool DownloadRecordingSegment(int id, const std::string& uri, std::string& outData);
+  // Fetches [offset, offset+length) of a completed recording's file via HTTP
+  // Range, re-authenticating transparently through Request() if the access
+  // token has expired mid-playback. outTotalLength reports the file's full
+  // size from the server's Content-Range response.
+  bool FetchRecordingFileRange(int id, int64_t offset, int64_t length,
+                               std::string& outData, int64_t& outTotalLength);
   bool DeleteRecording(int id);
   bool ScheduleRecording(int channelId,
                          time_t startTime,
@@ -125,12 +122,14 @@ private:
   struct HttpResponse {
     int statusCode = 0;
     std::string body;
+    std::string headers; // Raw response headers, one per line.
   };
-  
+
   HttpResponse Request(const std::string& method,
                        const std::string& endpoint,
                        const std::string& jsonBody = "",
-                       bool retryAuth = true);
+                       bool retryAuth = true,
+                       const std::string& rangeHeader = "");
   std::string GetBaseUrl() const;
   bool EnsureChannelMapping();
 };

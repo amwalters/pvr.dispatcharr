@@ -23,6 +23,7 @@
 #include "xtream_client.h"
 #include "dispatcharr_client.h"
 #include "recording/growing_recorded_stream.h"
+#include "recording/remote_file_recorded_stream.h"
 #include "recording/epg_recording_match.h"
 
 // Platform-specific time functions
@@ -374,8 +375,8 @@ public:
 
   ~CXtreamCodesPVRClient() override
   {
-    if (m_growingRecording)
-      m_growingRecording->Close();
+    if (m_activeRecordedStream)
+      m_activeRecordedStream->Close();
     m_stopRequested = true;
     m_cv.notify_all();
     m_epgCv.notify_all();
@@ -587,14 +588,17 @@ public:
       const kodi::addon::PVRRecording& recording,
       std::vector<kodi::addon::PVRStreamProperty>& properties) override
   {
-    // Return an authenticated Dispatcharr recording URL for playback.
-    // The recording file endpoint accepts JWT authentication via the
-    // `token` query parameter.
+    // Deliberately return no STREAMURL property: a static Dispatcharr URL
+    // (even with a token baked in) can't survive the JWT expiring mid-
+    // playback, since Kodi's player talks to it directly and never calls
+    // back into the addon to re-authenticate. Returning no URL instead
+    // selects Kodi's native recorded-stream API (Open/Read/Seek/Length
+    // RecordedStream below), which goes through Client::Request() and
+    // therefore gets the existing 401 retry-and-reauth handling for free.
     if (!m_dispatcharrClient)
       return PVR_ERROR_SERVER_ERROR;
 
     const std::string recordingId = recording.GetRecordingId();
-
     int id = 0;
     try
     {
@@ -617,30 +621,6 @@ public:
       return PVR_ERROR_SERVER_ERROR;
     }
 
-    if (recordingInfo.status == "recording")
-    {
-      // An empty URL deliberately selects Kodi's native recorded-stream API.
-      kodi::Log(ADDON_LOG_INFO,
-                "pvr.dispatcharr: Selected growing native stream for active recording %s",
-                recordingId.c_str());
-      return PVR_ERROR_NO_ERROR;
-    }
-
-    dispatcharr::RecordingPlayback playback;
-    if (!m_dispatcharrClient->GetRecordingPlayback(id, playback))
-    {
-      kodi::Log(ADDON_LOG_ERROR,
-                "pvr.dispatcharr: Failed to prepare completed recording %s",
-                recordingId.c_str());
-      return PVR_ERROR_SERVER_ERROR;
-    }
-    properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, playback.url);
-
-    // Do not log playback.url: it contains the short-lived playback JWT.
-    kodi::Log(ADDON_LOG_DEBUG,
-              "pvr.dispatcharr: Recording stream URL prepared for recording %s",
-              recordingId.c_str());
-
     return PVR_ERROR_NO_ERROR;
   }
 
@@ -653,37 +633,53 @@ public:
     catch (...) { return false; }
 
     dispatcharr::Recording info;
-    if (!m_dispatcharrClient->GetRecording(id, info) || info.status != "recording")
+    if (!m_dispatcharrClient->GetRecording(id, info))
       return false;
-    const std::string cacheDirectory =
-        TranslateSpecial("special://temp/pvr.dispatcharr/recorded-stream");
-    if (cacheDirectory.empty())
-      return false;
-    if (!m_growingRecording)
-      m_growingRecording = std::make_unique<dispatcharr::recording::GrowingRecordedStream>(
+
+    if (info.status == "recording")
+    {
+      const std::string cacheDirectory =
+          TranslateSpecial("special://temp/pvr.dispatcharr/recorded-stream");
+      if (cacheDirectory.empty())
+        return false;
+      auto growing = std::make_unique<dispatcharr::recording::GrowingRecordedStream>(
           *m_dispatcharrClient);
-    return m_growingRecording->Open(id, cacheDirectory);
+      if (!growing->Open(id, cacheDirectory))
+        return false;
+      m_activeRecordedStream = std::move(growing);
+      return true;
+    }
+
+    // Completed/interrupted: stream the file directly via authenticated
+    // HTTP Range requests instead of handing Kodi a URL with a fixed token.
+    auto remoteFile = std::make_unique<dispatcharr::recording::RemoteFileRecordedStream>(
+        *m_dispatcharrClient);
+    if (!remoteFile->Open(id))
+      return false;
+    m_activeRecordedStream = std::move(remoteFile);
+    return true;
   }
 
   void CloseRecordedStream() override
   {
-    if (m_growingRecording)
-      m_growingRecording->Close();
+    if (m_activeRecordedStream)
+      m_activeRecordedStream->Close();
+    m_activeRecordedStream.reset();
   }
 
   int ReadRecordedStream(unsigned char* buffer, unsigned int size) override
   {
-    return m_growingRecording ? m_growingRecording->Read(buffer, size) : -1;
+    return m_activeRecordedStream ? m_activeRecordedStream->Read(buffer, size) : -1;
   }
 
   int64_t SeekRecordedStream(int64_t position, int whence) override
   {
-    return m_growingRecording ? m_growingRecording->Seek(position, whence) : -1;
+    return m_activeRecordedStream ? m_activeRecordedStream->Seek(position, whence) : -1;
   }
 
   int64_t LengthRecordedStream() override
   {
-    return m_growingRecording ? m_growingRecording->Length() : -1;
+    return m_activeRecordedStream ? m_activeRecordedStream->Length() : -1;
   }
 
   PVR_ERROR GetTimerTypes(std::vector<kodi::addon::PVRTimerType>& types) override
@@ -1433,7 +1429,7 @@ public:
 
   bool CanSeekStream() override
   {
-    if (m_growingRecording && m_growingRecording->IsOpen())
+    if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
       return true;
     // Catchup streams support seeking via HTTP range requests
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1442,7 +1438,7 @@ public:
 
   bool CanPauseStream() override
   {
-    return m_growingRecording && m_growingRecording->IsOpen();
+    return m_activeRecordedStream && m_activeRecordedStream->IsOpen();
   }
 
   void PauseStream(bool paused) override
@@ -1452,7 +1448,7 @@ public:
 
   bool IsRealTimeStream() override
   {
-    if (m_growingRecording && m_growingRecording->IsOpen())
+    if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
       return false;
     // When playing catchup, this is NOT a realtime stream
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1461,12 +1457,17 @@ public:
 
   PVR_ERROR GetStreamTimes(kodi::addon::PVRStreamTimes& times) override
   {
-    if (m_growingRecording && m_growingRecording->IsOpen())
+    if (m_activeRecordedStream && m_activeRecordedStream->IsOpen())
     {
+      const int64_t duration = m_activeRecordedStream->DurationMicroseconds();
+      // A finished recording's duration isn't known ahead of demuxing (only
+      // its byte length is); let Kodi derive it from the stream itself.
+      if (duration <= 0)
+        return PVR_ERROR_NOT_IMPLEMENTED;
       times.SetStartTime(0);
       times.SetPTSStart(0);
       times.SetPTSBegin(0);
-      times.SetPTSEnd(m_growingRecording->DurationMicroseconds());
+      times.SetPTSEnd(duration);
       return PVR_ERROR_NO_ERROR;
     }
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -2740,7 +2741,7 @@ private:
   xtream::Settings m_settingsOverride;
   xtream::Settings m_xtreamSettings;
   std::unique_ptr<dispatcharr::Client> m_dispatcharrClient;
-  std::unique_ptr<dispatcharr::recording::GrowingRecordedStream> m_growingRecording;
+  std::unique_ptr<dispatcharr::recording::IRecordedStream> m_activeRecordedStream;
   std::string m_streamFormat;
   std::string m_channelNumbering;
   std::string m_filterPatternsRaw;
