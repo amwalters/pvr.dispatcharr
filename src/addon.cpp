@@ -22,6 +22,8 @@
 
 #include "xtream_client.h"
 #include "dispatcharr_client.h"
+#include "recording/growing_recorded_stream.h"
+#include "recording/epg_recording_match.h"
 
 // Platform-specific time functions
 #ifdef _WIN32
@@ -45,6 +47,10 @@
 
 namespace
 {
+constexpr auto kEpgRefreshInterval = std::chrono::minutes(60);
+constexpr auto kEpgRefreshRetryInterval = std::chrono::minutes(5);
+constexpr auto kRecordingPollInterval = std::chrono::seconds(10);
+
 std::string Trim(std::string s)
 {
   auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -357,17 +363,31 @@ public:
     : CInstancePVRClient(instance)
   {
     kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: instance created");
+    StartEpgWorkerThread();
+    const std::string cacheDirectory =
+        TranslateSpecial("special://temp/pvr.dispatcharr/recorded-stream");
+    if (!cacheDirectory.empty())
+      dispatcharr::recording::GrowingRecordedStream::CleanupStaleFiles(cacheDirectory);
+    StartRecordingMonitorThread();
     StartBootstrapThread();
   }
 
   ~CXtreamCodesPVRClient() override
   {
+    if (m_growingRecording)
+      m_growingRecording->Close();
     m_stopRequested = true;
     m_cv.notify_all();
+    m_epgCv.notify_all();
+    m_recordingCv.notify_all();
     if (m_bootstrap.joinable())
       m_bootstrap.join();
     if (m_worker.joinable())
       m_worker.join();
+    if (m_epgWorker.joinable())
+      m_epgWorker.join();
+    if (m_recordingMonitor.joinable())
+      m_recordingMonitor.join();
   }
 
   void SetSettingsOverride(const xtream::Settings& settings)
@@ -514,9 +534,9 @@ public:
 
     for (const auto& r : recordings)
     {
-       // Only show completed recordings in the recordings list
-       // In-progress ("recording") might work but file may be incomplete
-       if (r.status != "completed" && r.status != "interrupted") 
+       // Active recordings are playable through Dispatcharr's HLS endpoint.
+       if (r.status != "completed" && r.status != "interrupted" &&
+           r.status != "recording")
          continue;
 
        kodi::addon::PVRRecording rec;
@@ -524,10 +544,22 @@ public:
        rec.SetTitle(r.title.empty() ? "Unknown Recording" : r.title);
        rec.SetPlot(r.plot);
        rec.SetRecordingTime(r.startTime);
-       int duration = static_cast<int>(r.endTime - r.startTime);
+       const time_t effectiveEnd = r.status == "recording"
+                                       ? std::min(std::time(nullptr), r.endTime)
+                                       : r.endTime;
+       int duration = static_cast<int>(effectiveEnd - r.startTime);
        rec.SetDuration(duration > 0 ? duration : 0);
        // Stream URL is provided via GetRecordingStreamProperties
-       rec.SetChannelUid(static_cast<int>(r.channelId));
+       const int kodiChannelUid = r.kodiChannelUid != 0
+                                      ? r.kodiChannelUid
+                                      : ResolveKodiChannelUid(r.channelId);
+       if (kodiChannelUid > 0)
+         rec.SetChannelUid(kodiChannelUid);
+       const unsigned int kodiEpgUid = r.kodiEpgUid != EPG_TAG_INVALID_UID
+                                           ? r.kodiEpgUid
+                                           : ResolveRecordingEpgUid(r, kodiChannelUid);
+       if (kodiEpgUid != EPG_TAG_INVALID_UID)
+         rec.SetEPGEventId(kodiEpgUid);
        // Set poster image if available
        if (!r.iconPath.empty()) {
            rec.SetIconPath(r.iconPath);
@@ -576,8 +608,8 @@ public:
       return PVR_ERROR_INVALID_PARAMETERS;
     }
 
-    std::string streamUrl;
-    if (!m_dispatcharrClient->GetRecordingStreamUrl(id, streamUrl))
+    dispatcharr::Recording recordingInfo;
+    if (!m_dispatcharrClient->GetRecording(id, recordingInfo))
     {
       kodi::Log(ADDON_LOG_ERROR,
                 "pvr.dispatcharr: Failed to prepare playback for recording %s",
@@ -585,14 +617,73 @@ public:
       return PVR_ERROR_SERVER_ERROR;
     }
 
-    properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, streamUrl);
+    if (recordingInfo.status == "recording")
+    {
+      // An empty URL deliberately selects Kodi's native recorded-stream API.
+      kodi::Log(ADDON_LOG_INFO,
+                "pvr.dispatcharr: Selected growing native stream for active recording %s",
+                recordingId.c_str());
+      return PVR_ERROR_NO_ERROR;
+    }
 
-    // Do not log streamUrl: it contains the short-lived playback JWT.
+    dispatcharr::RecordingPlayback playback;
+    if (!m_dispatcharrClient->GetRecordingPlayback(id, playback))
+    {
+      kodi::Log(ADDON_LOG_ERROR,
+                "pvr.dispatcharr: Failed to prepare completed recording %s",
+                recordingId.c_str());
+      return PVR_ERROR_SERVER_ERROR;
+    }
+    properties.emplace_back(PVR_STREAM_PROPERTY_STREAMURL, playback.url);
+
+    // Do not log playback.url: it contains the short-lived playback JWT.
     kodi::Log(ADDON_LOG_DEBUG,
               "pvr.dispatcharr: Recording stream URL prepared for recording %s",
               recordingId.c_str());
 
     return PVR_ERROR_NO_ERROR;
+  }
+
+  bool OpenRecordedStream(const kodi::addon::PVRRecording& recording) override
+  {
+    if (!m_dispatcharrClient)
+      return false;
+    int id = 0;
+    try { id = std::stoi(recording.GetRecordingId()); }
+    catch (...) { return false; }
+
+    dispatcharr::Recording info;
+    if (!m_dispatcharrClient->GetRecording(id, info) || info.status != "recording")
+      return false;
+    const std::string cacheDirectory =
+        TranslateSpecial("special://temp/pvr.dispatcharr/recorded-stream");
+    if (cacheDirectory.empty())
+      return false;
+    if (!m_growingRecording)
+      m_growingRecording = std::make_unique<dispatcharr::recording::GrowingRecordedStream>(
+          *m_dispatcharrClient);
+    return m_growingRecording->Open(id, cacheDirectory);
+  }
+
+  void CloseRecordedStream() override
+  {
+    if (m_growingRecording)
+      m_growingRecording->Close();
+  }
+
+  int ReadRecordedStream(unsigned char* buffer, unsigned int size) override
+  {
+    return m_growingRecording ? m_growingRecording->Read(buffer, size) : -1;
+  }
+
+  int64_t SeekRecordedStream(int64_t position, int whence) override
+  {
+    return m_growingRecording ? m_growingRecording->Seek(position, whence) : -1;
+  }
+
+  int64_t LengthRecordedStream() override
+  {
+    return m_growingRecording ? m_growingRecording->Length() : -1;
   }
 
   PVR_ERROR GetTimerTypes(std::vector<kodi::addon::PVRTimerType>& types) override
@@ -717,7 +808,7 @@ public:
               t.SetTitle(r.name.empty() ? "Recurring" : r.name);
               t.SetTimerType(3);
               // Map Dispatcharr channel ID back to Kodi channel UID
-              int kodiUid = m_dispatcharrClient->GetKodiChannelUid(r.channelId);
+              int kodiUid = ResolveKodiChannelUid(r.channelId);
               if (kodiUid > 0) {
                   t.SetClientChannelUid(kodiUid);
               }
@@ -729,7 +820,7 @@ public:
           }
       }
 
-      // 3. Scheduled Recordings (Type 1)
+      // 3. Scheduled Recordings (manual type 1 or EPG-based type 4)
       std::vector<dispatcharr::Recording> recs;
       if (m_dispatcharrClient->FetchRecordings(recs)) {
           int timerCount = 0;
@@ -746,9 +837,19 @@ public:
               // Use the recording ID offset by 30000 to avoid collision
               t.SetClientIndex(static_cast<unsigned int>(30000 + r.id));
               t.SetTitle(r.title);
-              t.SetTimerType(1);
+              const int kodiUid = r.kodiChannelUid != 0
+                                      ? r.kodiChannelUid
+                                      : ResolveKodiChannelUid(r.channelId);
+              const unsigned int kodiEpgUid = r.kodiEpgUid != EPG_TAG_INVALID_UID
+                                                  ? r.kodiEpgUid
+                                                  : ResolveRecordingEpgUid(r, kodiUid);
+              if (kodiEpgUid != EPG_TAG_INVALID_UID) {
+                  t.SetTimerType(4);
+                  t.SetEPGUid(kodiEpgUid);
+              } else {
+                  t.SetTimerType(1);
+              }
               // Map Dispatcharr channel ID back to Kodi channel UID
-              int kodiUid = m_dispatcharrClient->GetKodiChannelUid(r.channelId);
               kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers - recording id=%d mapped channel %d -> kodiUid %d",
                         r.id, r.channelId, kodiUid);
               if (kodiUid > 0) {
@@ -766,7 +867,7 @@ public:
           }
           kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers - fetched %zu recordings, %d as timers", recs.size(), timerCount);
       }
-      
+
       kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: GetTimers complete");
       return PVR_ERROR_NO_ERROR;
   }
@@ -897,9 +998,17 @@ public:
           const char* typeStr = (typeId == 4) ? "EPG one-shot" : "manual one-shot";
           kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: AddTimer (%s) - calling Dispatcharr API POST /api/channels/recordings/ with channel=%d, title='%s'",
                     typeStr, dispatchChannelId, timer.GetTitle().c_str());
-          if (m_dispatcharrClient->ScheduleRecording(dispatchChannelId, timer.GetStartTime(), timer.GetEndTime(), timer.GetTitle())) {
+          const unsigned int epgUid = (typeId == 4) ? timer.GetEPGUid() : EPG_TAG_INVALID_UID;
+          const int kodiChannelUid = (typeId == 4) ? chanUid : 0;
+          if (m_dispatcharrClient->ScheduleRecording(dispatchChannelId,
+                                                     timer.GetStartTime(),
+                                                     timer.GetEndTime(),
+                                                     timer.GetTitle(),
+                                                     epgUid,
+                                                     kodiChannelUid)) {
               kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: AddTimer (one-shot) - Dispatcharr API returned success, calling TriggerTimerUpdate");
               TriggerTimerUpdate();
+              TriggerRecordingUpdate();
               return PVR_ERROR_NO_ERROR;
           } else {
               kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: AddTimer (one-shot) - Dispatcharr API returned failure");
@@ -1179,6 +1288,7 @@ public:
   PVR_ERROR GetEPGForChannel(int channelUid, time_t start, time_t end, kodi::addon::PVREPGTagsResultSet& results) override
   {
     EnsureLoaded();
+    RequestEpgRefreshIfStale();
 
     std::shared_ptr<const std::vector<xtream::ChannelEpg>> epgData;
     std::shared_ptr<const UidToStreamMap> uidToStream;
@@ -1235,7 +1345,15 @@ public:
       if (!entry.iconPath.empty())
         tag.SetIconPath(entry.iconPath);
       if (entry.genreType > 0)
+      {
         tag.SetGenreType(entry.genreType);
+        tag.SetGenreSubType(entry.genreSubType);
+      }
+      else if (!entry.genreString.empty())
+      {
+        tag.SetGenreType(EPG_GENRE_USE_STRING);
+        tag.SetGenreDescription(entry.genreString);
+      }
       if (entry.year > 0)
         tag.SetYear(entry.year);
       if (entry.starRating > 0)
@@ -1315,13 +1433,27 @@ public:
 
   bool CanSeekStream() override
   {
+    if (m_growingRecording && m_growingRecording->IsOpen())
+      return true;
     // Catchup streams support seeking via HTTP range requests
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_activeCatchupChannelUid != 0 && m_activeCatchup.programStart > 0;
   }
 
+  bool CanPauseStream() override
+  {
+    return m_growingRecording && m_growingRecording->IsOpen();
+  }
+
+  void PauseStream(bool paused) override
+  {
+    (void)paused;
+  }
+
   bool IsRealTimeStream() override
   {
+    if (m_growingRecording && m_growingRecording->IsOpen())
+      return false;
     // When playing catchup, this is NOT a realtime stream
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_activeCatchupChannelUid == 0;
@@ -1329,6 +1461,14 @@ public:
 
   PVR_ERROR GetStreamTimes(kodi::addon::PVRStreamTimes& times) override
   {
+    if (m_growingRecording && m_growingRecording->IsOpen())
+    {
+      times.SetStartTime(0);
+      times.SetPTSStart(0);
+      times.SetPTSBegin(0);
+      times.SetPTSEnd(m_growingRecording->DurationMicroseconds());
+      return PVR_ERROR_NO_ERROR;
+    }
     std::lock_guard<std::mutex> lock(m_mutex);
     
     // Check if we have an active catchup stream
@@ -1546,6 +1686,55 @@ public:
   }
 
 private:
+  unsigned int ResolveRecordingEpgUid(const dispatcharr::Recording& recording,
+                                      int kodiChannelUid)
+  {
+    std::shared_ptr<const std::vector<xtream::ChannelEpg>> epgData;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      epgData = m_epgData;
+    }
+    if (!epgData)
+      return EPG_TAG_INVALID_UID;
+
+    const unsigned int uid = dispatcharr::recording::MatchRecordingToEpg(
+        *epgData, kodiChannelUid, recording.startTime, recording.endTime, recording.title);
+    if (uid != EPG_TAG_INVALID_UID)
+      kodi::Log(ADDON_LOG_INFO,
+                "pvr.dispatcharr: Matched external recording %d to Kodi EPG event %u on channel %d",
+                recording.id, uid, kodiChannelUid);
+    return uid;
+  }
+
+  int ResolveKodiChannelUid(int dispatcharrChannelId)
+  {
+    // The Dispatcharr client maps its internal ID back to a channel number,
+    // not to Kodi's client channel UID. Kodi's UID is the Xtream stream ID.
+    const int channelNumber = m_dispatcharrClient->GetKodiChannelUid(dispatcharrChannelId);
+    if (channelNumber <= 0)
+      return -1;
+
+    std::shared_ptr<const std::vector<xtream::LiveStream>> streams;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      streams = m_streams;
+    }
+
+    if (streams)
+    {
+      for (const auto& stream : *streams)
+      {
+        if (stream.number == channelNumber)
+          return stream.id;
+      }
+    }
+
+    kodi::Log(ADDON_LOG_WARNING,
+              "pvr.dispatcharr: No Kodi channel UID found for Dispatcharr channel %d (number %d)",
+              dispatcharrChannelId, channelNumber);
+    return -1;
+  }
+
   struct GroupMember
   {
     unsigned int channelUid = 0;
@@ -1740,6 +1929,110 @@ private:
 
     (void)WriteStringToFileAtomic(path, blob);
   }
+
+  void StartEpgWorkerThread()
+  {
+    m_epgWorker = std::thread([this]() {
+      while (true)
+      {
+        uint64_t gen = 0;
+        xtream::Settings settings;
+        std::shared_ptr<const std::vector<xtream::LiveStream>> streams;
+
+        {
+          std::unique_lock<std::mutex> lock(m_mutex);
+          m_epgCv.wait(lock, [this]() { return m_stopRequested || m_epgRefreshRequested; });
+          if (m_stopRequested)
+            return;
+
+          m_epgRefreshRequested = false;
+          m_epgRefreshInProgress = true;
+          gen = m_generation.load();
+          settings = m_xtreamSettings;
+          streams = m_streams;
+        }
+
+        if (!streams)
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          m_epgRefreshInProgress = false;
+          continue;
+        }
+
+        std::string xmltvData;
+        const xtream::FetchResult fetchResult = xtream::FetchXMLTVEpg(settings, xmltvData);
+        std::vector<xtream::ChannelEpg> parsedEpg;
+        const bool parsed = fetchResult.ok && xtream::ParseXMLTV(xmltvData, *streams, parsedEpg);
+        std::vector<unsigned int> channelUids;
+
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          m_epgRefreshInProgress = false;
+
+          // A settings/channel reload invalidates results from an older request.
+          if (m_stopRequested || gen != m_generation.load())
+            continue;
+
+          if (parsed)
+          {
+            m_epgData = std::make_shared<std::vector<xtream::ChannelEpg>>(std::move(parsedEpg));
+            m_lastSuccessfulEpgRefresh = std::chrono::steady_clock::now();
+            if (m_uidToStreamId)
+            {
+              channelUids.reserve(m_uidToStreamId->size());
+              for (const auto& entry : *m_uidToStreamId)
+                channelUids.push_back(entry.first);
+            }
+          }
+        }
+
+        if (!fetchResult.ok)
+        {
+          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to refresh XMLTV EPG data: %s",
+                    fetchResult.details.c_str());
+          continue;
+        }
+        if (!parsed)
+        {
+          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to parse refreshed XMLTV data");
+          continue;
+        }
+
+        kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: refreshed EPG for %zu channels",
+                  channelUids.size());
+        // Kodi callbacks must not be made while holding m_mutex.
+        for (const unsigned int channelUid : channelUids)
+          TriggerEpgUpdate(channelUid);
+      }
+    });
+  }
+
+  void RequestEpgRefreshIfStale()
+  {
+    bool notify = false;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      if (m_stopRequested || !m_dataLoaded || !m_streams || m_epgRefreshInProgress ||
+          m_epgRefreshRequested)
+        return;
+
+      const auto now = std::chrono::steady_clock::now();
+      if (m_epgData && m_lastSuccessfulEpgRefresh != std::chrono::steady_clock::time_point{} &&
+          now - m_lastSuccessfulEpgRefresh < kEpgRefreshInterval)
+        return;
+      if (m_lastEpgRefreshAttempt != std::chrono::steady_clock::time_point{} &&
+          now - m_lastEpgRefreshAttempt < kEpgRefreshRetryInterval)
+        return;
+
+      m_lastEpgRefreshAttempt = now;
+      m_epgRefreshRequested = true;
+      notify = true;
+    }
+
+    if (notify)
+      m_epgCv.notify_one();
+  }
+
   void StartWorkerThread()
   {
     bool shouldStart = false;
@@ -2137,32 +2430,6 @@ private:
           m_groupsReady = true;
         }
 
-        // Load EPG data from XMLTV endpoint
-        std::string xmltvData;
-        const xtream::FetchResult epgResult = xtream::FetchXMLTVEpg(settings, xmltvData);
-        if (epgResult.ok)
-        {
-          kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: fetched XMLTV EPG data");
-          std::vector<xtream::ChannelEpg> epgData;
-          if (xtream::ParseXMLTV(xmltvData, streams, epgData))
-          {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_epgData = std::make_shared<std::vector<xtream::ChannelEpg>>(std::move(epgData));
-            
-            kodi::Log(ADDON_LOG_INFO, "pvr.dispatcharr: loaded EPG for %zu channels",
-                      m_epgData ? m_epgData->size() : 0u);
-          }
-          else
-          {
-            kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to parse XMLTV data");
-          }
-        }
-        else
-        {
-          kodi::Log(ADDON_LOG_WARNING, "pvr.dispatcharr: failed to fetch XMLTV EPG data: %s", 
-                    epgResult.details.c_str());
-        }
-
         kodi::Log(ADDON_LOG_INFO,
                   "pvr.dispatcharr: loaded %zu channels in %zu categories (%lld ms)",
                   m_channels ? m_channels->size() : 0u, categories.size(), static_cast<long long>(ms));
@@ -2174,9 +2441,91 @@ private:
         // Best-effort cache write so startup can seed channels immediately.
         SaveCache(m_settingsSignature, categories, cacheChannels);
 
+        // EPG has its own refresh worker so XMLTV network/parsing work never blocks
+        // this channel loader or Kodi's PVR callback threads.
+        RequestEpgRefreshIfStale();
+
         // Always refresh groups after reload so Kodi drops stale groups/members.
         TriggerChannelUpdate();
         TriggerChannelGroupsUpdate();
+      }
+    });
+  }
+
+  void StartRecordingMonitorThread()
+  {
+    m_recordingMonitor = std::thread([this]() {
+      std::string clientSignature;
+      std::unique_ptr<dispatcharr::Client> client;
+      std::unordered_map<int, std::string> previousStatuses;
+
+      while (!m_stopRequested)
+      {
+        xtream::Settings settings;
+        {
+          std::lock_guard<std::mutex> lock(m_mutex);
+          settings = m_xtreamSettings;
+        }
+
+        const std::string password = !settings.dispatcharrPassword.empty()
+                                         ? settings.dispatcharrPassword
+                                         : settings.password;
+        const std::string signature = settings.server + "\n" +
+                                      std::to_string(settings.port) + "\n" +
+                                      settings.username + "\n" + password;
+        if (!settings.server.empty() && !settings.username.empty() && !password.empty())
+        {
+          if (!client || signature != clientSignature)
+          {
+            dispatcharr::DvrSettings ds;
+            ds.server = settings.server;
+            ds.port = settings.port;
+            ds.username = settings.username;
+            ds.password = password;
+            ds.timeoutSeconds = settings.timeoutSeconds;
+            client = std::make_unique<dispatcharr::Client>(ds);
+            clientSignature = signature;
+            previousStatuses.clear();
+          }
+
+          std::vector<dispatcharr::Recording> recordings;
+          if (client->FetchRecordings(recordings))
+          {
+            std::unordered_map<int, std::string> currentStatuses;
+            bool changed = false;
+            for (const auto& recording : recordings)
+            {
+              currentStatuses.emplace(recording.id, recording.status);
+              const auto old = previousStatuses.find(recording.id);
+              if (old == previousStatuses.end())
+              {
+                changed = true;
+              }
+              else if (old->second != recording.status)
+              {
+                changed = true;
+                kodi::Log(ADDON_LOG_INFO,
+                          "pvr.dispatcharr: recording %d changed status from '%s' to '%s'",
+                          recording.id, old->second.c_str(), recording.status.c_str());
+              }
+            }
+            changed = changed || currentStatuses.size() != previousStatuses.size();
+
+            // Notify only for actual collection/status transitions. Triggering
+            // from GetTimers(), or on every poll while active, creates a refresh
+            // feedback loop that can cancel playback while Kodi starts it.
+            if (changed)
+            {
+              TriggerTimerUpdate();
+              TriggerRecordingUpdate();
+            }
+            previousStatuses = std::move(currentStatuses);
+          }
+        }
+
+        std::unique_lock<std::mutex> lock(m_recordingMutex);
+        m_recordingCv.wait_for(lock, kRecordingPollInterval,
+                              [this]() { return m_stopRequested.load(); });
       }
     });
   }
@@ -2328,6 +2677,9 @@ private:
       m_loading = true;
       m_dataLoaded = false;
       m_groupsReady = false;
+      m_epgData.reset();
+      m_lastSuccessfulEpgRefresh = {};
+      m_lastEpgRefreshAttempt = {};
 
       m_xtreamSettings = std::move(xt);
 
@@ -2364,8 +2716,13 @@ private:
 
   std::mutex m_mutex;
   std::condition_variable m_cv;
+  std::condition_variable m_epgCv;
   std::thread m_worker;
+  std::thread m_epgWorker;
   std::thread m_bootstrap;
+  std::thread m_recordingMonitor;
+  std::mutex m_recordingMutex;
+  std::condition_variable m_recordingCv;
   std::atomic<bool> m_stopRequested{false};
   std::atomic<uint64_t> m_generation{0};
   std::atomic<int64_t> m_lastRefreshTriggerMs{0};
@@ -2374,11 +2731,16 @@ private:
   bool m_loading = false;
   bool m_dataLoaded = false;
   bool m_groupsReady = false;
+  bool m_epgRefreshRequested = false;
+  bool m_epgRefreshInProgress = false;
+  std::chrono::steady_clock::time_point m_lastSuccessfulEpgRefresh;
+  std::chrono::steady_clock::time_point m_lastEpgRefreshAttempt;
   std::string m_settingsSignature;
   bool m_hasSettingsOverride = false;
   xtream::Settings m_settingsOverride;
   xtream::Settings m_xtreamSettings;
   std::unique_ptr<dispatcharr::Client> m_dispatcharrClient;
+  std::unique_ptr<dispatcharr::recording::GrowingRecordedStream> m_growingRecording;
   std::string m_streamFormat;
   std::string m_channelNumbering;
   std::string m_filterPatternsRaw;

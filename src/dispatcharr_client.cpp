@@ -4,11 +4,13 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -200,18 +202,41 @@ std::string JsonEscape(const std::string& input)
 
 time_t ParseIsoTime(const std::string& iso)
 {
-  // 2026-01-23T10:00:00Z
-  if (iso.empty()) return 0;
+  // Dispatcharr returns timezone-aware ISO 8601 values. Convert them to UTC;
+  // mktime() would incorrectly interpret the fields in Kodi's local timezone.
+  if (iso.size() < 19)
+    return 0;
+
   struct tm tm = {};
-  if (iso.size() >= 19) {
-    sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d", 
-           &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-           &tm.tm_hour, &tm.tm_min, &tm.tm_sec);
-    tm.tm_year -= 1900;
-    tm.tm_mon -= 1;
-    return mktime(&tm);
+  if (sscanf(iso.c_str(), "%d-%d-%dT%d:%d:%d",
+             &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+             &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6)
+    return 0;
+
+  tm.tm_year -= 1900;
+  tm.tm_mon -= 1;
+#ifdef _WIN32
+  time_t result = _mkgmtime(&tm);
+#else
+  time_t result = timegm(&tm);
+#endif
+  if (result == static_cast<time_t>(-1))
+    return 0;
+
+  // A positive offset means the wall clock is ahead of UTC, so subtract it.
+  if (iso.size() >= 25 && (iso[19] == '+' || iso[19] == '-') && iso[22] == ':')
+  {
+    int offsetHours = 0;
+    int offsetMinutes = 0;
+    if (sscanf(iso.c_str() + 20, "%2d:%2d", &offsetHours, &offsetMinutes) == 2 &&
+        offsetHours <= 23 && offsetMinutes <= 59)
+    {
+      const time_t offset = static_cast<time_t>(offsetHours * 3600 + offsetMinutes * 60);
+      result += (iso[19] == '+') ? -offset : offset;
+    }
   }
-  return 0;
+
+  return result;
 }
 
 std::string TimeToIso(time_t t)
@@ -307,6 +332,7 @@ Client::HttpResponse Client::Request(const std::string& method,
                                      const std::string& jsonBody,
                                      bool retryAuth)
 {
+  std::lock_guard<std::recursive_mutex> requestLock(m_requestMutex);
   HttpResponse resp;
   std::string url = GetBaseUrl() + endpoint;
   
@@ -364,7 +390,8 @@ Client::HttpResponse Client::Request(const std::string& method,
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     resp.statusCode = static_cast<int>(httpCode);
     kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response code: %d", resp.statusCode);
-    kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response: %s", resp.body.substr(0, 500).c_str());
+    if (endpoint.find("/hls/seg_") == std::string::npos)
+      kodi::Log(ADDON_LOG_DEBUG, "pvr.dispatcharr: Response: %s", resp.body.substr(0, 500).c_str());
   } else {
     kodi::Log(ADDON_LOG_ERROR, "pvr.dispatcharr: curl_easy_perform failed: %s", curl_easy_strerror(res));
     resp.statusCode = 0;
@@ -390,6 +417,7 @@ Client::HttpResponse Client::Request(const std::string& method,
 
 bool Client::EnsureToken()
 {
+  std::lock_guard<std::recursive_mutex> requestLock(m_requestMutex);
   if (!m_accessToken.empty()) return true;
   
   std::stringstream ss;
@@ -710,6 +738,42 @@ bool Client::FetchRecordings(std::vector<Recording>& outRecordings)
           ExtractStringField(customProps, "status", r.status);
           // Extract poster_url for cover art
           ExtractStringField(customProps, "poster_url", r.iconPath);
+
+          std::string kodiEpgUid;
+          if (ExtractStringField(customProps, "kodi_epg_uid", kodiEpgUid)) {
+              const bool digitsOnly = !kodiEpgUid.empty() &&
+                  std::all_of(kodiEpgUid.begin(), kodiEpgUid.end(),
+                              [](unsigned char c) { return std::isdigit(c) != 0; });
+              errno = 0;
+              char* end = nullptr;
+              const unsigned long value = std::strtoul(kodiEpgUid.c_str(), &end, 10);
+              if (digitsOnly && errno == 0 && end && *end == '\0' &&
+                  value <= std::numeric_limits<unsigned int>::max()) {
+                  r.kodiEpgUid = static_cast<unsigned int>(value);
+              } else {
+                  kodi::Log(ADDON_LOG_WARNING,
+                            "pvr.dispatcharr: Invalid Kodi EPG UID for recording %d",
+                            r.id);
+              }
+          }
+
+          std::string kodiChannelUid;
+          if (ExtractStringField(customProps, "kodi_channel_uid", kodiChannelUid)) {
+              const bool digitsOnly = !kodiChannelUid.empty() &&
+                  std::all_of(kodiChannelUid.begin(), kodiChannelUid.end(),
+                              [](unsigned char c) { return std::isdigit(c) != 0; });
+              errno = 0;
+              char* end = nullptr;
+              const unsigned long value = std::strtoul(kodiChannelUid.c_str(), &end, 10);
+              if (digitsOnly && errno == 0 && end && *end == '\0' && value > 0 &&
+                  value <= static_cast<unsigned long>(std::numeric_limits<int>::max())) {
+                  r.kodiChannelUid = static_cast<int>(value);
+              } else {
+                  kodi::Log(ADDON_LOG_WARNING,
+                            "pvr.dispatcharr: Invalid Kodi channel UID for recording %d",
+                            r.id);
+              }
+          }
       }
       
       // Default to "scheduled" if status is missing (e.g. newly created recordings
@@ -726,7 +790,88 @@ bool Client::FetchRecordings(std::vector<Recording>& outRecordings)
 
 bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
 {
-  outUrl.clear();
+  RecordingPlayback playback;
+  if (!GetRecordingPlayback(id, playback))
+  {
+    outUrl.clear();
+    return false;
+  }
+  outUrl = std::move(playback.url);
+  return true;
+}
+
+bool Client::GetRecording(int id, Recording& outRecording)
+{
+  std::vector<Recording> recordings;
+  if (!FetchRecordings(recordings))
+    return false;
+  const auto it = std::find_if(recordings.begin(), recordings.end(),
+                               [id](const Recording& value) { return value.id == id; });
+  if (it == recordings.end())
+    return false;
+  outRecording = *it;
+  return true;
+}
+
+bool Client::FetchActiveRecordingManifest(int id, std::string& outManifest)
+{
+  outManifest.clear();
+  if (!EnsureToken())
+    return false;
+  const auto response = Request(
+      "GET", "/api/channels/recordings/" + std::to_string(id) + "/hls/index.m3u8");
+  if (response.statusCode != 200 || response.body.find("#EXTM3U") == std::string::npos)
+    return false;
+  outManifest = response.body;
+  return true;
+}
+
+bool Client::DownloadRecordingSegment(int id, const std::string& uri, std::string& outData)
+{
+  outData.clear();
+  if (!EnsureToken())
+    return false;
+
+  std::string endpoint = uri;
+  if (endpoint.rfind("http://", 0) == 0 || endpoint.rfind("https://", 0) == 0)
+  {
+    // Dispatcharr may advertise its public URL without the explicit/default
+    // port present in the add-on setting. Extract only the path and fetch it
+    // from our configured server, so credentials can never be sent to the
+    // playlist-provided authority.
+    const size_t scheme = endpoint.find("://");
+    const size_t path = endpoint.find('/', scheme + 3);
+    if (path == std::string::npos)
+      return false;
+    endpoint.erase(0, path);
+  }
+  else if (endpoint.empty() || endpoint.front() != '/')
+    endpoint = "/api/channels/recordings/" + std::to_string(id) + "/hls/" + endpoint;
+
+  // Authorization headers are refreshed automatically by Request(). Discard
+  // any short-lived token copied into the playlist URI.
+  const size_t query = endpoint.find('?');
+  if (query != std::string::npos)
+    endpoint.erase(query);
+  const std::string allowedPrefix = "/api/channels/recordings/" +
+                                    std::to_string(id) + "/hls/";
+  if (endpoint.rfind(allowedPrefix, 0) != 0 || endpoint.find("..") != std::string::npos)
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "pvr.dispatcharr: Refusing unexpected recording segment path '%s'",
+              endpoint.c_str());
+    return false;
+  }
+  const auto response = Request("GET", endpoint);
+  if (response.statusCode != 200 || response.body.empty())
+    return false;
+  outData = response.body;
+  return true;
+}
+
+bool Client::GetRecordingPlayback(int id, RecordingPlayback& outPlayback)
+{
+  outPlayback = {};
 
   // Refresh the recording list first. Besides confirming that the recording
   // still exists, this makes an authenticated request and therefore exercises
@@ -756,8 +901,55 @@ bool Client::GetRecordingStreamUrl(int id, std::string& outUrl)
   // Dispatcharr's recording file endpoint accepts JWT authentication through
   // the `token` query parameter for clients that cannot attach Authorization
   // headers to media requests.
-  outUrl = GetBaseUrl() + "/api/channels/recordings/" +
-           std::to_string(id) + "/file/?token=" + m_accessToken;
+  outPlayback.inProgress = it->status == "recording";
+  if (!outPlayback.inProgress)
+  {
+    outPlayback.url = GetBaseUrl() + "/api/channels/recordings/" +
+                      std::to_string(id) + "/file/?token=" + m_accessToken;
+    return true;
+  }
+
+  const auto playlistResponse = Request(
+      "GET", "/api/channels/recordings/" + std::to_string(id) + "/hls/index.m3u8");
+  if (playlistResponse.statusCode != 200 ||
+      playlistResponse.body.find("#EXTM3U") == std::string::npos)
+  {
+    kodi::Log(ADDON_LOG_ERROR,
+              "pvr.dispatcharr: Failed to fetch active HLS playlist for recording %d",
+              id);
+    return false;
+  }
+
+  // Snapshot the currently recorded portion as VOD. Dispatcharr intentionally
+  // omits ENDLIST while recording, which makes FFmpeg start at the live edge
+  // and disables seeking even though the playlist contains every segment.
+  std::istringstream input(playlistResponse.body);
+  std::ostringstream output;
+  std::string line;
+  bool insertedPlaybackTags = false;
+  while (std::getline(input, line))
+  {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (!line.empty() && line.front() != '#' &&
+        (line.rfind("http://", 0) == 0 || line.rfind("https://", 0) == 0) &&
+        line.find("token=") == std::string::npos)
+    {
+      line += (line.find('?') == std::string::npos ? "?token=" : "&token=");
+      line += m_accessToken;
+    }
+    output << line << '\n';
+    if (!insertedPlaybackTags && line == "#EXTM3U")
+    {
+      output << "#EXT-X-PLAYLIST-TYPE:VOD\n"
+             << "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n";
+      insertedPlaybackTags = true;
+    }
+  }
+  if (playlistResponse.body.find("#EXT-X-ENDLIST") == std::string::npos)
+    output << "#EXT-X-ENDLIST\n";
+
+  outPlayback.playlist = output.str();
 
   return true;
 }
@@ -774,14 +966,25 @@ bool Client::DeleteRecording(int id)
   return success;
 }
 
-bool Client::ScheduleRecording(int channelId, time_t startTime, time_t endTime, const std::string& title)
+bool Client::ScheduleRecording(int channelId,
+                               time_t startTime,
+                               time_t endTime,
+                               const std::string& title,
+                               unsigned int kodiEpgUid,
+                               int kodiChannelUid)
 {
   if (!EnsureToken()) return false;
   std::stringstream ss;
   ss << "{\"channel\":" << channelId 
      << ",\"start_time\":\"" << TimeToIso(startTime) << "\""
      << ",\"end_time\":\"" << TimeToIso(endTime) << "\""
-     << ",\"custom_properties\":{\"program\":{\"title\":\"" << JsonEscape(title) << "\"}} }";
+     << ",\"custom_properties\":{\"program\":{\"title\":\"" << JsonEscape(title) << "\"}";
+  if (kodiEpgUid != 0 && kodiChannelUid != 0)
+  {
+    ss << ",\"kodi_epg_uid\":\"" << kodiEpgUid << "\""
+       << ",\"kodi_channel_uid\":\"" << kodiChannelUid << "\"";
+  }
+  ss << "}}";
   
   auto resp = Request("POST", "/api/channels/recordings/", ss.str());
   // HTTP 201 Created is the correct success response for POST

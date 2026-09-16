@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <ctime>
 
 namespace dispatcharr
@@ -47,6 +48,15 @@ struct Recording
   std::string iconPath; // poster_url from custom_properties
   time_t startTime = 0;
   time_t endTime = 0;
+  unsigned int kodiEpgUid = 0; // Kodi EPG event associated with this recording
+  int kodiChannelUid = 0; // Kodi channel associated with the EPG event
+};
+
+struct RecordingPlayback
+{
+  std::string url;
+  std::string playlist;
+  bool inProgress = false;
 };
 
 struct TokenResponse
@@ -91,12 +101,22 @@ public:
   // Recordings
   bool FetchRecordings(std::vector<Recording>& outRecordings);
   bool GetRecordingStreamUrl(int id, std::string& outUrl);
+  bool GetRecordingPlayback(int id, RecordingPlayback& outPlayback);
+  bool GetRecording(int id, Recording& outRecording);
+  bool FetchActiveRecordingManifest(int id, std::string& outManifest);
+  bool DownloadRecordingSegment(int id, const std::string& uri, std::string& outData);
   bool DeleteRecording(int id);
-  bool ScheduleRecording(int channelId, time_t startTime, time_t endTime, const std::string& title);
+  bool ScheduleRecording(int channelId,
+                         time_t startTime,
+                         time_t endTime,
+                         const std::string& title,
+                         unsigned int kodiEpgUid = 0,
+                         int kodiChannelUid = 0);
 
 private:
   DvrSettings m_settings;
   std::string m_accessToken;
+  std::recursive_mutex m_requestMutex;
   std::map<int, int> m_channelNumberToDispatchId;  // Maps channel number to Dispatcharr ID
   std::map<int, int> m_dispatchIdToChannelNumber;  // Maps Dispatcharr ID to channel number (Kodi UID)
   std::map<int, std::string> m_kodiUidToDispatchTvgId; // Maps Kodi UID to Dispatcharr tvg_id
