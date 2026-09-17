@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<addon id="@ADDON_ID@" version="1.3" name="@ADDON_NAME@" provider-name="northernpowerhouse">
+<addon id="@ADDON_ID@" version="@ADDON_VERSION@" name="@ADDON_NAME@" provider-name="northernpowerhouse">
   <requires>
     <import addon="kodi.binary.instance.pvr" version="8.2.0"/>
   </requires>

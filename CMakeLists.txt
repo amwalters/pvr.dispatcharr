@@ -42,6 +42,13 @@ if(Kodi_FOUND)
   # Read version from version.txt (after project() declaration)
   file(READ ${CMAKE_CURRENT_SOURCE_DIR}/version.txt ADDON_VERSION)
   string(STRIP "${ADDON_VERSION}" ADDON_VERSION)
+
+  # Kodi 21's addon_version() expects a literal numeric version in
+  # addon.xml.in. Override it so version.txt remains the source of truth.
+  macro(addon_version dir prefix)
+    set(${prefix}_VERSION "${ADDON_VERSION}")
+    message(STATUS "${prefix}_VERSION=${${prefix}_VERSION}")
+  endmacro()
   
   set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
