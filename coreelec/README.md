@@ -33,7 +33,8 @@ The defaults can be overridden with environment variables:
 ```bash
 COREELEC_DIR=/path/to/CoreELEC-21.3 \
 OUTPUT_DIR="$PWD/dist/coreelec" \
-PROJECT=Amlogic-ng \
+PROJECT=Amlogic-ce \
+DEVICE=Amlogic-ng \
 ARCH=arm \
 ./scripts/build-coreelec.sh
 ```

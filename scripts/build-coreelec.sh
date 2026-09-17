@@ -8,7 +8,8 @@ readonly COREELEC_REPOSITORY="${COREELEC_REPOSITORY:-https://github.com/CoreELEC
 readonly COREELEC_REF="${COREELEC_REF:-15970b8e469b8e299a8947b1751593bdaf53ed82}"
 readonly COREELEC_DIR="${COREELEC_DIR:-${RUNNER_TEMP:-${SOURCE_DIR}/.coreelec-build}/CoreELEC}"
 readonly OUTPUT_DIR="${OUTPUT_DIR:-${SOURCE_DIR}/dist/coreelec}"
-readonly PROJECT="${PROJECT:-Amlogic-ng}"
+readonly PROJECT="${PROJECT:-Amlogic-ce}"
+readonly DEVICE="${DEVICE:-Amlogic-ng}"
 readonly ARCH="${ARCH:-arm}"
 readonly PACKAGE_DIR="${COREELEC_DIR}/packages/mediacenter/kodi-binary-addons/pvr.dispatcharr"
 readonly HOST_PATCH="${SOURCE_DIR}/coreelec/patches/coreelec-21-modern-host.patch"
@@ -73,10 +74,10 @@ if [ -n "${COREELEC_CCACHE_DIR:-}" ]; then
   export CCACHE_DIR="${COREELEC_CCACHE_DIR}"
 fi
 
-echo "Building pvr.dispatcharr for CoreELEC ${PROJECT}.${ARCH}"
+echo "Building pvr.dispatcharr for CoreELEC ${PROJECT}/${DEVICE}.${ARCH}"
 (
   cd "${COREELEC_DIR}"
-  env PROJECT="${PROJECT}" ARCH="${ARCH}" ./scripts/create_addon pvr.dispatcharr
+  env PROJECT="${PROJECT}" DEVICE="${DEVICE}" ARCH="${ARCH}" ./scripts/create_addon pvr.dispatcharr
 )
 
 mkdir -p "${OUTPUT_DIR}"

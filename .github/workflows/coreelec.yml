@@ -39,7 +39,8 @@ jobs:
     timeout-minutes: 360
     env:
       ARCH: arm
-      PROJECT: Amlogic-ng
+      PROJECT: Amlogic-ce
+      DEVICE: Amlogic-ng
       COREELEC_DIR: /tmp/CoreELEC
       COREELEC_SOURCES_DIR: /tmp/coreelec-sources
       COREELEC_CCACHE_DIR: /tmp/coreelec-ccache
