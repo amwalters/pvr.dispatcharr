@@ -1,4 +1,5 @@
 build/
 dist/
+.coreelec-build/
 .DS_Store
 kodi.log
