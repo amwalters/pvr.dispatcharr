@@ -28,6 +28,31 @@ diff --git a/packages/devel/autoconf/package.mk b/packages/devel/autoconf/packag
  PKG_DEPENDS_HOST="ccache:host m4:host gettext:host"
  PKG_LONGDESC="A GNU tool for automatically configuring source code."
 
+diff --git a/packages/devel/mpc/package.mk b/packages/devel/mpc/package.mk
+--- a/packages/devel/mpc/package.mk
++++ b/packages/devel/mpc/package.mk
+@@ -6,7 +6,7 @@ PKG_VERSION="1.3.1"
+ PKG_SHA256="ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8"
+ PKG_LICENSE="LGPL"
+ PKG_SITE="https://www.multiprecision.org"
+-PKG_URL="http://ftpmirror.gnu.org/mpc/${PKG_NAME}-${PKG_VERSION}.tar.gz"
++PKG_URL="https://ftp.gnu.org/gnu/mpc/${PKG_NAME}-${PKG_VERSION}.tar.gz"
+ PKG_DEPENDS_HOST="ccache:host gmp:host mpfr:host"
+ PKG_LONGDESC="A C library for the arithmetic of complex numbers with arbitrarily high precision and correct rounding of the result."
+
+diff --git a/packages/devel/mpfr/package.mk b/packages/devel/mpfr/package.mk
+--- a/packages/devel/mpfr/package.mk
++++ b/packages/devel/mpfr/package.mk
+@@ -6,7 +6,7 @@ PKG_VERSION="4.2.1"
+ PKG_SHA256="277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2"
+ PKG_LICENSE="LGPL"
+ PKG_SITE="http://www.mpfr.org/"
+-PKG_URL="http://ftpmirror.gnu.org/mpfr/${PKG_NAME}-${PKG_VERSION}.tar.xz"
++PKG_URL="https://ftp.gnu.org/gnu/mpfr/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+ PKG_DEPENDS_HOST="ccache:host gmp:host"
+ PKG_DEPENDS_TARGET="gmp"
+ PKG_LONGDESC="A C library for multiple-precision floating-point computations with exact rounding."
+
 diff --git a/packages/devel/gmp/package.mk b/packages/devel/gmp/package.mk
 --- a/packages/devel/gmp/package.mk
 +++ b/packages/devel/gmp/package.mk
@@ -108,6 +133,15 @@ diff --git a/packages/lang/gcc/package.mk b/packages/lang/gcc/package.mk
 index 41ac317..236aeab 100644
 --- a/packages/lang/gcc/package.mk
 +++ b/packages/lang/gcc/package.mk
+@@ -6,7 +6,7 @@ PKG_VERSION="13.2.0"
+ PKG_SHA256="e275e76442a6067341a27f04c5c6b83d8613144004c0413528863dc6b5c743da"
+ PKG_LICENSE="GPL-2.0-or-later"
+ PKG_SITE="https://gcc.gnu.org/"
+-PKG_URL="https://ftpmirror.gnu.org/gcc/${PKG_NAME}-${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
++PKG_URL="https://ftp.gnu.org/gnu/gcc/${PKG_NAME}-${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+ PKG_DEPENDS_BOOTSTRAP="ccache:host autoconf:host binutils:host gmp:host mpfr:host mpc:host zstd:host"
+ PKG_DEPENDS_TARGET="toolchain"
+ PKG_DEPENDS_HOST="ccache:host autoconf:host binutils:host gmp:host mpfr:host mpc:host zstd:host glibc libxcrypt"
 @@ -104,8 +104,13 @@ EOF
      ln -sf ../gcc/${TARGET_NAME}/${GCC_VERSION}/liblto_plugin.so ${TOOLCHAIN}/lib/bfd-plugins
  }
