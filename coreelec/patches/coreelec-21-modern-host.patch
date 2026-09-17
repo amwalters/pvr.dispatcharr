@@ -195,10 +195,10 @@ index 2490965..a7f373e 100644
  PKG_DEPENDS_TARGET="toolchain"
  PKG_LONGDESC="Free software implementation of IDNA2008, Punycode and TR46."
 
- diff --git a/distributions/CoreELEC/options b/distributions/CoreELEC/options
+diff --git a/distributions/CoreELEC/options b/distributions/CoreELEC/options
 --- a/distributions/CoreELEC/options
 +++ b/distributions/CoreELEC/options
-@@ -42,7 +42,7 @@
+@@ -42,6 +42,6 @@
    HARDENING_SUPPORT="no"
 
  # Default supported get handlers (archive, git, file etc.)
