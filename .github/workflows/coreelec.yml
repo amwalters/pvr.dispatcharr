@@ -40,9 +40,9 @@ jobs:
     env:
       ARCH: arm
       PROJECT: Amlogic-ng
-      COREELEC_DIR: ${{ runner.temp }}/CoreELEC
-      COREELEC_SOURCES_DIR: ${{ runner.temp }}/coreelec-sources
-      COREELEC_CCACHE_DIR: ${{ runner.temp }}/coreelec-ccache
+      COREELEC_DIR: /tmp/CoreELEC
+      COREELEC_SOURCES_DIR: /tmp/coreelec-sources
+      COREELEC_CCACHE_DIR: /tmp/coreelec-ccache
       OUTPUT_DIR: ${{ github.workspace }}/dist/coreelec
 
     steps:
