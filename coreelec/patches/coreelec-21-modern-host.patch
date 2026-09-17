@@ -15,10 +15,31 @@ index cba9aea..81c340b 100644
  }
 
  makeinstall_host() {
+
+diff --git a/packages/devel/autoconf/package.mk b/packages/devel/autoconf/package.mk
+--- a/packages/devel/autoconf/package.mk
++++ b/packages/devel/autoconf/package.mk
+@@ -6,7 +6,7 @@ PKG_VERSION="2.71"
+ PKG_SHA256="f14c83cfebcc9427f2c3cea7258bd90df972d92eb26752da4ddad81c87a0faa4"
+ PKG_LICENSE="GPL"
+ PKG_SITE="http://sources.redhat.com/autoconf/"
+-PKG_URL="http://ftpmirror.gnu.org/autoconf/${PKG_NAME}-${PKG_VERSION}.tar.xz"
++PKG_URL="https://ftp.gnu.org/gnu/autoconf/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+ PKG_DEPENDS_HOST="ccache:host m4:host gettext:host"
+ PKG_LONGDESC="A GNU tool for automatically configuring source code."
+
 diff --git a/packages/devel/gmp/package.mk b/packages/devel/gmp/package.mk
-index ff5a6c2..ff93efd 100644
 --- a/packages/devel/gmp/package.mk
 +++ b/packages/devel/gmp/package.mk
+@@ -6,7 +6,7 @@ PKG_VERSION="6.3.0"
+ PKG_SHA256="a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
+ PKG_LICENSE="LGPLv3+"
+ PKG_SITE="http://gmplib.org/"
+-PKG_URL="https://gmplib.org/download/gmp/${PKG_NAME}-${PKG_VERSION}.tar.xz"
++PKG_URL="https://ftp.gnu.org/gnu/gmp/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+ PKG_DEPENDS_HOST="ccache:host m4:host"
+ PKG_DEPENDS_TARGET="toolchain"
+ PKG_LONGDESC="A library for arbitrary precision arithmetic, operating on signed integers, rational numbers, and floating point numbers."
 @@ -17,4 +17,5 @@ PKG_CONFIGURE_OPTS_HOST="--enable-cxx --enable-static --disable-shared"
 
  pre_configure_host() {
