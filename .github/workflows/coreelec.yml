@@ -67,7 +67,8 @@ jobs:
             python3 rpcsvc-proto
 
       - name: Restore CoreELEC downloads and compiler cache
-        uses: actions/cache@v4
+        id: coreelec_cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.COREELEC_SOURCES_DIR }}
@@ -78,6 +79,15 @@ jobs:
 
       - name: Build installable addon ZIP
         run: ./scripts/build-coreelec.sh
+
+      - name: Save CoreELEC downloads and compiler cache
+        if: always() && steps.coreelec_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.COREELEC_SOURCES_DIR }}
+            ${{ env.COREELEC_CCACHE_DIR }}
+          key: ${{ steps.coreelec_cache.outputs.cache-primary-key }}
 
       - name: Show artifact and disk usage
         if: always()
