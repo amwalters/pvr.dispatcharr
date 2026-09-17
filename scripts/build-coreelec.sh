@@ -76,7 +76,7 @@ fi
 echo "Building pvr.dispatcharr for CoreELEC ${PROJECT}.${ARCH}"
 (
   cd "${COREELEC_DIR}"
-  PROJECT="${PROJECT}" ARCH="${ARCH}" ./scripts/create_addon pvr.dispatcharr
+  env PROJECT="${PROJECT}" ARCH="${ARCH}" ./scripts/create_addon pvr.dispatcharr
 )
 
 mkdir -p "${OUTPUT_DIR}"
